@@ -175,6 +175,7 @@ class PtychographyModel(ForwardModel):
         self.argument_ls = args
         self.run_bfloat16 = run_bfloat16
         self.run_float64 = run_float64
+        self.master_slave_patch_shape_logged = False
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
@@ -203,10 +204,6 @@ class PtychographyModel(ForwardModel):
         :param use_master_slave: Bool flag indicating whether master-slave mode is active.
         :return: Array with shape [minibatch_size, len_probe_y, len_probe_x]. Magnitude of detected wavefields.
         """
-        if use_master_slave:
-            # Placeholder for dual-channel propagation that will incorporate ``noise``, ``probe_slave_real``,
-            # and ``probe_slave_imag`` in master-slave mode. For now, reuse the single-channel path.
-            pass
         if self.run_bfloat16:
             obj = obj.bfloat16()
             probe_real = probe_real.bfloat16()
@@ -238,6 +235,7 @@ class PtychographyModel(ForwardModel):
         n_theta = self.common_vars['n_theta']
         precalculate_rotation_coords = self.common_vars['precalculate_rotation_coords']
         theta_ls = self.common_vars['theta_ls']
+        stdout_options = self.common_vars['stdout_options']
 
         if precalculate_rotation_coords:
             coord_ls = read_origin_coords('arrsize_{}_{}_{}_ntheta_{}'.format(*this_obj_size, n_theta),
@@ -292,12 +290,18 @@ class PtychographyModel(ForwardModel):
         ex_mag_ls = []
 
         # Pad if needed
+        pad_arr = np.array([[0, 0], [0, 0]])
         if self.distribution_mode is None:
             obj_rot, pad_arr = pad_object(obj_rot, this_obj_size, this_pos_batch, probe_size, unknown_type=unknown_type)
+            if use_master_slave and noise is not None:
+                pad_cfg = [[0, 0]] * (len(noise.shape) - 2) + pad_arr.tolist()
+                if np.count_nonzero(pad_arr) > 0:
+                    noise = w.pad(noise, pad_cfg, mode='edge')
 
         pos_ind = 0
         for k, pos_batch in enumerate(probe_pos_batch_ls):
             subobj_ls = []
+            subnoise_ls = []
             probe_real_ls = []
             probe_imag_ls = []
 
@@ -330,6 +334,9 @@ class PtychographyModel(ForwardModel):
                     else:
                         subobj = obj_rot[pos_y:pos_y + probe_size[0], pos_x:pos_x + probe_size[1], :, :]
                     subobj_ls = w.reshape(subobj, [1, *subobj.shape])
+                    if use_master_slave and noise is not None:
+                        subnoise = noise[pos_y:pos_y + probe_size[0], pos_x:pos_x + probe_size[1]]
+                        subnoise_ls = w.reshape(subnoise, [1, *subnoise.shape])
                 else:
                     for j in range(len(pos_batch)):
                         pos = pos_batch[j]
@@ -337,10 +344,27 @@ class PtychographyModel(ForwardModel):
                         pos_x = pos[1] + pad_arr[1, 0]
                         subobj = obj_rot[pos_y:pos_y + probe_size[0], pos_x:pos_x + probe_size[1], :, :]
                         subobj_ls.append(subobj)
+                        if use_master_slave and noise is not None:
+                            subnoise = noise[pos_y:pos_y + probe_size[0], pos_x:pos_x + probe_size[1]]
+                            subnoise_ls.append(subnoise)
                     subobj_ls = w.stack(subobj_ls)
+                    if use_master_slave and noise is not None:
+                        subnoise_ls = w.stack(subnoise_ls)
             else:
                 subobj_ls = obj_rot[pos_ind:pos_ind + len(pos_batch), :, :, :, :]
+                if use_master_slave and noise is not None:
+                    if len(noise.shape) < 3:
+                        raise ValueError('Master-slave background map must include a leading batch dimension in distributed mode.')
+                    subnoise_ls = noise[pos_ind:pos_ind + len(pos_batch), :, :]
                 pos_ind += len(pos_batch)
+
+            if use_master_slave and not self.master_slave_patch_shape_logged:
+                subnoise_shape = None
+                if use_master_slave and noise is not None:
+                    subnoise_shape = tuple(subnoise_ls.shape)
+                print_flush('Master-slave patch shapes -> subobj: {}, subnoise: {}.'.format(
+                    tuple(subobj_ls.shape), subnoise_shape), 0, rank, **stdout_options)
+                self.master_slave_patch_shape_logged = True
 
             gc.collect()
             if n_probe_modes == 1:
@@ -382,7 +406,7 @@ class PtychographyModel(ForwardModel):
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
                 ex_mag_ls.append(w.sqrt(ex_int))
-        del subobj_ls, probe_real_ls, probe_imag_ls
+        del subobj_ls, subnoise_ls, probe_real_ls, probe_imag_ls
 
         # Output shape is [minibatch_size, y, x].
         if len(ex_mag_ls) > 1:
