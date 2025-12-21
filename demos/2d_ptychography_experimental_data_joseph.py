@@ -80,7 +80,7 @@ for h5_path in h5_files:
                        'n_epochs': 400,
                        'obj_size': (rec_y, rec_x, 1),
                        'two_d_mode': True,
-                       'background_data': bg_centered,
+                       'background_data': r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\background_centered_1920.tiff",
                        # 'energy_ev': 571,
                        # 'psize_cm': 1.3365e-06,
                        'minibatch_size': 10,
