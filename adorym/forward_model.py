@@ -47,6 +47,7 @@ class ForwardModel(object):
         self.device = device
         self.simulation_mode = simulation_mode
         self.current_loss = 0
+        self.regularizer_values = {}
         self.raw_data_type = raw_data_type
         self.i_call = 0
         self.common_vars = common_vars_dict
@@ -72,10 +73,13 @@ class ForwardModel(object):
     def add_regularizers(self, reg_list):
         self.reg_list = reg_list
 
-    def get_regularization_value(self, obj, device=None):
+    def get_regularization_value(self, obj, device=None, **kwargs):
         reg = w.create_variable(0., device=self.device)
+        self.regularizer_values = {}
         for r in self.reg_list:
-            reg = reg + r.get_value(obj, distribution_mode=self.distribution_mode, device=device)
+            term = r.get_value(obj, distribution_mode=self.distribution_mode, device=device, **kwargs)
+            self.regularizer_values[r.name] = term
+            reg = reg + term
         print_flush('  Reg term = {}.'.format(w.to_numpy(reg)), 0, rank, **self.stdout_options)
         return reg
 
@@ -136,7 +140,7 @@ class ForwardModel(object):
             print_flush('  {} valid pixels remain after applying beamstop mask.'.format(this_pred_batch.shape[1]), 0, rank)
         loss = self.get_mismatch_loss(this_pred_batch, this_prj_batch)
         if len(self.reg_list) > 0:
-            loss = loss + self.get_regularization_value(obj, device=self.device)
+            loss = loss + self.get_regularization_value(obj, device=self.device, **self.loss_args)
         loss_val = w.to_numpy(loss)
         try:
             loss_val = float(loss_val)

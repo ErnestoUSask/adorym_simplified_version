@@ -56,6 +56,8 @@ def reconstruct_ptychography(
         # |Raw data and experimental parameters|________________________________
         fname, obj_size, probe_pos=None, theta_st=0, theta_end=PI, n_theta=None, theta_downsample=None,
         energy_ev=None, psize_cm=None, free_prop_cm=None, background_data=None,
+        background_tv_weight=1e-7, probe_slave_ratio_weight=1e-3, probe_slave_max_ratio=0.2,
+        background_mean_pull_weight=None, regularizer_log_interval=1,
         raw_data_type='magnitude', # Choose from 'magnitude' or 'intensity'
         is_minus_logged=False, # Select True if raw data (usually conventional tomography) is minus-logged
         slice_pos_cm_ls=None,
@@ -591,6 +593,16 @@ def reconstruct_ptychography(
                     regularizers.append(L1Regularizer(alpha_d, alpha_b, unknown_type=unknown_type))
             if gamma not in [0, None]:
                 regularizers.append(TVRegularizer(gamma, unknown_type=unknown_type))
+        if use_master_slave:
+            if not any(isinstance(r, BackgroundTVRegularizer) for r in regularizers) and \
+                    background_tv_weight not in [0, None]:
+                regularizers.append(BackgroundTVRegularizer(background_tv_weight))
+            if not any(isinstance(r, ProbeSlaveRatioRegularizer) for r in regularizers) and \
+                    probe_slave_ratio_weight not in [0, None]:
+                regularizers.append(ProbeSlaveRatioRegularizer(probe_slave_ratio_weight, probe_slave_max_ratio))
+            if bg_mean is not None and background_mean_pull_weight not in [0, None] and \
+                    not any(isinstance(r, BackgroundMeanPullRegularizer) for r in regularizers):
+                regularizers.append(BackgroundMeanPullRegularizer(background_mean_pull_weight, target_mean=bg_mean))
         forward_model.add_regularizers(regularizers)
         reg_rwl1 = None
         reweighted_l1 = False
@@ -1383,6 +1395,18 @@ def reconstruct_ptychography(
                 'Epoch {} (rank {}); Delta-t = {} s; current time = {} s,'.format(i_epoch, rank,
                                                                     time.time() - t0, time.time() - t_zero),
                 sto_rank, rank, **stdout_options)
+            if use_master_slave and rank == 0 and regularizer_log_interval not in [None, 0]:
+                if (i_epoch - starting_epoch + 1) % regularizer_log_interval == 0:
+                    reg_vals = []
+                    for k, v in forward_model.regularizer_values.items():
+                        try:
+                            v = float(w.to_numpy(v))
+                        except:
+                            v = float(w.to_numpy(v._value)) if hasattr(v, '_value') else v
+                        reg_vals.append('{}={}'.format(k, v))
+                    if len(reg_vals) > 0:
+                        print_flush('Regularizer values (epoch {}): {}'.format(i_epoch, ', '.join(reg_vals)),
+                                    sto_rank, rank, **stdout_options)
             i_epoch = i_epoch + 1
 
             # ================================================================================
