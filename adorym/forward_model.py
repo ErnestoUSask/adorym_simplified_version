@@ -176,6 +176,8 @@ class PtychographyModel(ForwardModel):
         self.run_bfloat16 = run_bfloat16
         self.run_float64 = run_float64
         self.master_slave_patch_shape_logged = False
+        self.master_slave_activation_logged = False
+        self.master_slave_grad_logged = False
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
@@ -208,6 +210,10 @@ class PtychographyModel(ForwardModel):
             obj = obj.bfloat16()
             probe_real = probe_real.bfloat16()
             probe_imag = probe_imag.bfloat16()
+            if probe_slave_real is not None:
+                probe_slave_real = probe_slave_real.bfloat16()
+            if probe_slave_imag is not None:
+                probe_slave_imag = probe_slave_imag.bfloat16()
         device_obj = self.common_vars['device_obj']
         lmbda_nm = self.common_vars['lmbda_nm']
         voxel_nm = self.common_vars['voxel_nm']
@@ -244,6 +250,11 @@ class PtychographyModel(ForwardModel):
         flag_pp_sqrt = True
         if self.raw_data_type == 'magnitude':
             flag_pp_sqrt = False
+
+        if use_master_slave and not self.master_slave_activation_logged:
+            print_flush('Master-slave propagation enabled: coherently summing master and slave exit waves.',
+                        0, rank, **stdout_options)
+            self.master_slave_activation_logged = True
 
         # Allocate subbatches.
         probe_pos_batch_ls = []
@@ -304,6 +315,8 @@ class PtychographyModel(ForwardModel):
             subnoise_ls = []
             probe_real_ls = []
             probe_imag_ls = []
+            probe_slave_real_ls = []
+            probe_slave_imag_ls = []
 
             # Get shifted probe list.
             for j in range(len(pos_batch)):
@@ -314,14 +327,25 @@ class PtychographyModel(ForwardModel):
                                                                                    device=device_obj)
                     probe_real_ls.append(probe_real_shifted)
                     probe_imag_ls.append(probe_imag_shifted)
+                    if use_master_slave and probe_slave_real is not None and probe_slave_imag is not None:
+                        probe_slave_real_shifted, probe_slave_imag_shifted = realign_image_fourier(
+                            probe_slave_real, probe_slave_imag, this_shift, axes=(1, 2), device=device_obj)
+                        probe_slave_real_ls.append(probe_slave_real_shifted)
+                        probe_slave_imag_ls.append(probe_slave_imag_shifted)
             if optimize_all_probe_pos or len(w.nonzero(probe_pos_correction > 1e-3)) > 0:
                 # Shape of probe_xxx_ls.shape is [n_dp_batch, n_probe_modes, y, x].
                 probe_real_ls = w.stack(probe_real_ls)
                 probe_imag_ls = w.stack(probe_imag_ls)
+                if use_master_slave and probe_slave_real is not None and probe_slave_imag is not None:
+                    probe_slave_real_ls = w.stack(probe_slave_real_ls)
+                    probe_slave_imag_ls = w.stack(probe_slave_imag_ls)
             else:
                 # Shape of probe_xxx_ls.shape is [n_probe_modes, y, x].
                 probe_real_ls = probe_real
                 probe_imag_ls = probe_imag
+                if use_master_slave:
+                    probe_slave_real_ls = probe_slave_real
+                    probe_slave_imag_ls = probe_slave_imag
 
             # Get object list.
             if self.distribution_mode is None:
@@ -366,41 +390,75 @@ class PtychographyModel(ForwardModel):
                     tuple(subobj_ls.shape), subnoise_shape), 0, rank, **stdout_options)
                 self.master_slave_patch_shape_logged = True
 
+            if use_master_slave and noise is not None:
+                if len(subnoise_ls.shape) == 3:
+                    subnoise_ls = w.reshape(subnoise_ls, [subnoise_ls.shape[0], subnoise_ls.shape[1],
+                                                          subnoise_ls.shape[2], 1])
+                if len(subnoise_ls.shape) == 4 and subnoise_ls.shape[-1] != 2:
+                    zeros_like_noise = w.zeros_like(subnoise_ls)
+                    subnoise_ls = w.stack([subnoise_ls, zeros_like_noise], axis=-1)
+
+            master_batch_shape = [len(pos_batch), *probe_size, this_obj_size[-1]]
+            slave_batch_shape = None
+            if use_master_slave and noise is not None:
+                slave_depth = subnoise_ls.shape[-2] if len(subnoise_ls.shape) >= 4 else 1
+                slave_batch_shape = [len(pos_batch), *probe_size, slave_depth]
+
+            def propagate_master_slave(master_real, master_imag, slave_real=None, slave_imag=None):
+                ex_m_real, ex_m_imag = multislice_propagate_batch(
+                    subobj_ls,
+                    master_real, master_imag,
+                    energy_ev, psize_cm * ds_level, kernel=h, free_prop_cm=free_prop_cm, binning=self.binning,
+                    obj_batch_shape=master_batch_shape,
+                    fresnel_approx=fresnel_approx, pure_projection=pure_projection, device=device_obj,
+                    type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
+                    scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
+                    pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
+                if use_master_slave and noise is not None and slave_real is not None and slave_imag is not None:
+                    ex_s_real, ex_s_imag = multislice_propagate_batch(
+                        subnoise_ls,
+                        slave_real, slave_imag,
+                        energy_ev, psize_cm * ds_level, kernel=h, free_prop_cm=free_prop_cm, binning=self.binning,
+                        obj_batch_shape=slave_batch_shape,
+                        fresnel_approx=fresnel_approx, pure_projection=pure_projection, device=device_obj,
+                        type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
+                        scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
+                        pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
+                    ex_m_real = ex_m_real + ex_s_real
+                    ex_m_imag = ex_m_imag + ex_s_imag
+                return ex_m_real, ex_m_imag
+
             gc.collect()
             if n_probe_modes == 1:
                 if len(probe_real_ls.shape) == 3:
                     this_probe_real_ls = probe_real_ls[0, :, :]
                     this_probe_imag_ls = probe_imag_ls[0, :, :]
+                    this_probe_slave_real_ls = probe_slave_real_ls[0, :, :] if use_master_slave and probe_slave_real_ls is not None else None
+                    this_probe_slave_imag_ls = probe_slave_imag_ls[0, :, :] if use_master_slave and probe_slave_imag_ls is not None else None
                 else:
                     this_probe_real_ls = probe_real_ls[:, 0, :, :]
                     this_probe_imag_ls = probe_imag_ls[:, 0, :, :]
-                ex_real, ex_imag = multislice_propagate_batch(
-                                subobj_ls,
-                                this_probe_real_ls, this_probe_imag_ls,
-                                energy_ev, psize_cm * ds_level, kernel=h, free_prop_cm=free_prop_cm, binning=self.binning,
-                                obj_batch_shape=[len(pos_batch), *probe_size, this_obj_size[-1]],
-                                fresnel_approx=fresnel_approx, pure_projection=pure_projection, device=device_obj,
-                                type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
-                                scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
-                                pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
+                    this_probe_slave_real_ls = probe_slave_real_ls[:, 0, :, :] if use_master_slave and probe_slave_real_ls is not None else None
+                    this_probe_slave_imag_ls = probe_slave_imag_ls[:, 0, :, :] if use_master_slave and probe_slave_imag_ls is not None else None
+                ex_real, ex_imag = propagate_master_slave(
+                    this_probe_real_ls, this_probe_imag_ls,
+                    slave_real=this_probe_slave_real_ls, slave_imag=this_probe_slave_imag_ls)
                 ex_mag_ls.append(w.norm(ex_real, ex_imag))
             else:
                 for i_mode in range(n_probe_modes):
                     if len(probe_real_ls.shape) == 3:
                         this_probe_real_ls = probe_real_ls[i_mode, :, :]
                         this_probe_imag_ls = probe_imag_ls[i_mode, :, :]
+                        this_probe_slave_real_ls = probe_slave_real_ls[i_mode, :, :] if use_master_slave and probe_slave_real_ls is not None else None
+                        this_probe_slave_imag_ls = probe_slave_imag_ls[i_mode, :, :] if use_master_slave and probe_slave_imag_ls is not None else None
                     else:
                         this_probe_real_ls = probe_real_ls[:, i_mode, :, :]
                         this_probe_imag_ls = probe_imag_ls[:, i_mode, :, :]
-                    temp_real, temp_imag = multislice_propagate_batch(
-                                subobj_ls,
-                                this_probe_real_ls, this_probe_imag_ls,
-                                energy_ev, psize_cm * ds_level, kernel=h, free_prop_cm=free_prop_cm, binning=self.binning,
-                                obj_batch_shape=[len(pos_batch), *probe_size, this_obj_size[-1]],
-                                fresnel_approx=fresnel_approx, pure_projection=pure_projection, device=device_obj,
-                                type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
-                                scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
-                                pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
+                        this_probe_slave_real_ls = probe_slave_real_ls[:, i_mode, :, :] if use_master_slave and probe_slave_real_ls is not None else None
+                        this_probe_slave_imag_ls = probe_slave_imag_ls[:, i_mode, :, :] if use_master_slave and probe_slave_imag_ls is not None else None
+                    temp_real, temp_imag = propagate_master_slave(
+                        this_probe_real_ls, this_probe_imag_ls,
+                        slave_real=this_probe_slave_real_ls, slave_imag=this_probe_slave_imag_ls)
                     if i_mode == 0:
                         ex_int = temp_real ** 2 + temp_imag ** 2
                     else:
