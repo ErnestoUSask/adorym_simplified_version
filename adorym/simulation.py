@@ -188,6 +188,9 @@ def simulate_ptychography(
     sto_rank = 0 if not debug else rank
     print_flush('Output folder is {}'.format(output_folder), sto_rank, rank, **stdout_options)
 
+    use_master_slave = False
+    background_data = None
+
     # ================================================================================
     # Create pointer for raw data.
     # ================================================================================
@@ -689,5 +692,4 @@ def simulate_ptychography(
             print_flush('Terminating program because maximum time limit is reached.', sto_rank, rank,
                         **stdout_options)
             sys.exit()
-
 
