@@ -178,7 +178,8 @@ class PtychographyModel(ForwardModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset,
+                noise=None, probe_slave_real=None, probe_slave_imag=None, use_master_slave=False):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
         by the ``get_loss_function`` method.
@@ -196,8 +197,16 @@ class PtychographyModel(ForwardModel):
         :param tilt_ls: Array with shape [3, n_theta]. 3-axis tilt to be applied before propagation.
         :param prj_pos_offset: Array with shape [n_theta, 2]. Projection position offset for each angle, in pixels. Note
             that this is different from probe_pos_offset - shifting is applied after passing through the object.
+        :param noise: Background map for master-slave mode.
+        :param probe_slave_real: Slave channel probe real component for master-slave mode.
+        :param probe_slave_imag: Slave channel probe imaginary component for master-slave mode.
+        :param use_master_slave: Bool flag indicating whether master-slave mode is active.
         :return: Array with shape [minibatch_size, len_probe_y, len_probe_x]. Magnitude of detected wavefields.
         """
+        if use_master_slave:
+            # Placeholder for dual-channel propagation that will incorporate ``noise``, ``probe_slave_real``,
+            # and ``probe_slave_imag`` in master-slave mode. For now, reuse the single-channel path.
+            pass
         if self.run_bfloat16:
             obj = obj.bfloat16()
             probe_real = probe_real.bfloat16()
@@ -389,12 +398,15 @@ class PtychographyModel(ForwardModel):
     def get_loss_function(self):
         def calculate_loss(obj, probe_real, probe_imag, probe_defocus_mm,
                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                           probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                           probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset,
+                           noise=None, probe_slave_real=None, probe_slave_imag=None, use_master_slave=False):
             theta_downsample = self.common_vars['theta_downsample']
             ds_level = self.common_vars['ds_level']
             this_pred_batch = self.predict(obj, probe_real, probe_imag, probe_defocus_mm,
                                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                                           probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset)
+                                           probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset,
+                                           noise=noise, probe_slave_real=probe_slave_real,
+                                           probe_slave_imag=probe_slave_imag, use_master_slave=use_master_slave)
             this_prj_batch = self.get_data(this_i_theta, this_ind_batch, theta_downsample=theta_downsample, ds_level=ds_level)
             loss = self.loss(this_pred_batch, this_prj_batch, obj)
             return loss
@@ -411,7 +423,8 @@ class SingleBatchFullfieldModel(PtychographyModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset,
+                noise=None, probe_slave_real=None, probe_slave_imag=None, use_master_slave=False):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
         by the ``get_loss_function`` method.
@@ -427,6 +440,10 @@ class SingleBatchFullfieldModel(PtychographyModel):
         :param probe_pos_correction: Array with shape [n_probes, 2]. Additive correction values of probe positions.
         :param this_ind_batch: List of Int. Current batch of tile indices.
         :param tilt_ls: Array with shape [3, n_theta]. 3-axis tilt to be applied before propagation.
+        :param noise: Background map for master-slave mode (unused for single-batch fullfield).
+        :param probe_slave_real: Slave channel probe real component (unused for single-batch fullfield).
+        :param probe_slave_imag: Slave channel probe imaginary component (unused for single-batch fullfield).
+        :param use_master_slave: Bool flag indicating whether master-slave mode is active.
         :return: Array with shape [minibatch_size, len_probe_y, len_probe_x]. Magnitude of detected wavefields.
         """
         device_obj = self.common_vars['device_obj']
@@ -500,7 +517,8 @@ class SingleBatchPtychographyModel(PtychographyModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset,
+                noise=None, probe_slave_real=None, probe_slave_imag=None, use_master_slave=False):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
         by the ``get_loss_function`` method.
@@ -516,6 +534,10 @@ class SingleBatchPtychographyModel(PtychographyModel):
         :param probe_pos_correction: Array with shape [n_probes, 2]. Additive correction values of probe positions.
         :param this_ind_batch: List of Int. Current batch of tile indices.
         :param tilt_ls: Array with shape [3, n_theta]. 3-axis tilt to be applied before propagation.
+        :param noise: Background map for master-slave mode (unused for single-batch ptychography).
+        :param probe_slave_real: Slave channel probe real component (unused for single-batch ptychography).
+        :param probe_slave_imag: Slave channel probe imaginary component (unused for single-batch ptychography).
+        :param use_master_slave: Bool flag indicating whether master-slave mode is active.
         :return: Array with shape [minibatch_size, len_probe_y, len_probe_x]. Magnitude of detected wavefields.
         """
 
