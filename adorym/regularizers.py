@@ -8,8 +8,9 @@ class Regularizer(object):
     :param unknown_type: String. Can be ``'delta_beta'`` or ``'real_imag'``.
     :param device: Device object or ``None``.
     """
-    def __init__(self, unknown_type='delta_beta'):
+    def __init__(self, unknown_type='delta_beta', name=None):
         self.unknown_type = unknown_type
+        self.name = name or type(self).__name__
 
     def get_value(self, obj, device=None, **kwargs):
         pass
@@ -107,6 +108,75 @@ class TVRegularizer(Regularizer):
             axis_offset = 0 if distribution_mode is None else 1
             reg = reg + self.gamma * total_variation_3d(r ** 2 + i ** 2, axis_offset=axis_offset)
             reg = reg + self.gamma * total_variation_3d(w.arctan2(i, r), axis_offset=axis_offset)
+        return reg
+
+
+class BackgroundTVRegularizer(Regularizer):
+    """Total variation regularizer for background map N.
+
+    :param gamma: Weight of TV term.
+    """
+
+    def __init__(self, gamma):
+        super().__init__(unknown_type=None)
+        self.gamma = gamma
+
+    def get_value(self, obj, noise=None, distribution_mode=None, device=None, **kwargs):
+        reg = w.create_variable(0., device=device)
+        if noise is None or self.gamma in [0, None]:
+            return reg
+        axis_offset = 0 if distribution_mode is None else 1
+        reg = reg + self.gamma * total_variation_3d(noise, axis_offset=axis_offset)
+        return reg
+
+
+class BackgroundMeanPullRegularizer(Regularizer):
+    """L2 pull of background map N towards provided mean value.
+
+    :param weight: Weight of the L2 term.
+    :param target_mean: Mean background value.
+    """
+
+    def __init__(self, weight, target_mean=None):
+        super().__init__(unknown_type=None)
+        self.weight = weight
+        self.target_mean = target_mean
+
+    def get_value(self, obj, noise=None, device=None, **kwargs):
+        reg = w.create_variable(0., device=device)
+        if noise is None or self.weight in [0, None] or self.target_mean is None:
+            return reg
+        target_mean = self.target_mean
+        if not hasattr(target_mean, 'shape'):
+            target_mean = w.create_variable(target_mean, device=device, requires_grad=False)
+        reg = reg + self.weight * w.mean((noise - target_mean) ** 2)
+        return reg
+
+
+class ProbeSlaveRatioRegularizer(Regularizer):
+    """Keep slave probe magnitude below a fraction of master probe magnitude.
+
+    :param weight: Weight of the ratio penalty term.
+    :param max_ratio: Maximum allowed ||P_s|| / ||P_m|| ratio before penalization.
+    """
+
+    def __init__(self, weight, max_ratio):
+        super().__init__(unknown_type=None)
+        self.weight = weight
+        self.max_ratio = max_ratio
+
+    def get_value(self, obj, probe_real=None, probe_imag=None, probe_slave_real=None,
+                  probe_slave_imag=None, device=None, **kwargs):
+        reg = w.create_variable(0., device=device)
+        if self.weight in [0, None] or probe_slave_real is None or probe_slave_imag is None:
+            return reg
+        if probe_real is None or probe_imag is None:
+            return reg
+        eps = 1e-12
+        master_norm = w.vec_norm(w.sqrt(probe_real ** 2 + probe_imag ** 2))
+        slave_norm = w.vec_norm(w.sqrt(probe_slave_real ** 2 + probe_slave_imag ** 2))
+        ratio = slave_norm / (master_norm + eps)
+        reg = reg + self.weight * w.mean(w.clip(ratio - self.max_ratio, 0, np.inf) ** 2)
         return reg
 
 
