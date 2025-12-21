@@ -137,6 +137,15 @@ for 2D fly-scan ptychography reconstruction with probe position refinement:
                                                    distribution_mode=distribution_mode,
                                                    options_dict={"step_size": 1e-2})
 
+    # Enable master–slave background handling by supplying a TIFF stack path.
+    # You can also provide an in-memory NumPy array with shape (n_bg, y, x) or (y, x).
+    params_ptych = {"fname": "data.h5",
+                    "background_data": "bg_stack.tiff",
+                    "probe_slave_ratio_weight": 1e-3,
+                    "probe_slave_max_ratio": 0.2,
+                    ...}
+
+    # Or combine with the rest of your reconstruction settings:
     params_ptych = {"fname": "data.h5",
                     "theta_st": 0,
                     "theta_end": 0,
