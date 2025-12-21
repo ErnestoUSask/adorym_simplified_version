@@ -364,6 +364,27 @@ def reconstruct_ptychography(
                       'object mode, all ranks must'
                       'process data from the same rotation angle in each synchronized'
                       'batch.')
+    master_slave_init_logged = False
+
+    def initialize_background_map_from_mean(bg_value, detector_shape, target_shape, dtype, device, backend_name):
+        """
+        Create a background map aligned to the object grid. If detector and object sizes differ,
+        deterministically pad/crop to the target shape using existing padding utilities.
+        """
+        bg_arr = np.full(detector_shape, bg_value, dtype='float32')
+        bg_arr = w.create_variable(bg_arr, device=device, requires_grad=True, dtype=dtype)
+        if tuple(detector_shape) != tuple(target_shape):
+            pad_y = max(target_shape[0] - int(bg_arr.shape[0]), 0)
+            pad_x = max(target_shape[1] - int(bg_arr.shape[1]), 0)
+            if pad_y > 0 or pad_x > 0:
+                pad_cfg = [[pad_y // 2, pad_y - pad_y // 2], [pad_x // 2, pad_x - pad_x // 2]]
+                bg_arr = w.pad(bg_arr, pad_cfg, mode='edge', backend=backend_name)
+            current_shape = bg_arr.shape
+            if current_shape[0] > target_shape[0] or current_shape[1] > target_shape[1]:
+                start_y = max((int(current_shape[0]) - target_shape[0]) // 2, 0)
+                start_x = max((int(current_shape[1]) - target_shape[1]) // 2, 0)
+                bg_arr = bg_arr[start_y:start_y + target_shape[0], start_x:start_x + target_shape[1]]
+        return bg_arr
 
     for ds_level in range(multiscale_level - 1, -1, -1):
 
@@ -681,6 +702,30 @@ def reconstruct_ptychography(
         probe_imag = w.create_variable(probe_imag, device=device_obj)
 
         # ================================================================================
+        # Initialize master-slave specific parameters.
+        # ================================================================================
+        probe_dtype_ref = probe_real
+        if optimizable_params is not None and isinstance(optimizable_params, dict):
+            probe_dtype_ref = optimizable_params.get('probe_real', probe_dtype_ref)
+        probe_imag_ref = probe_imag
+        if optimizable_params is not None and isinstance(optimizable_params, dict):
+            probe_imag_ref = optimizable_params.get('probe_imag', probe_imag_ref)
+        slave_probe_alpha = 0.1
+        background_map = None
+        probe_slave_real = None
+        probe_slave_imag = None
+        if use_master_slave:
+            detector_shape = prj_shape[-2:]
+            target_shape = this_obj_size[:2]
+            dtype_str = w.get_dtype(probe_dtype_ref, backend=global_settings.backend)
+            background_map = initialize_background_map_from_mean(bg_mean, detector_shape, target_shape, dtype_str,
+                                                                 device_obj, global_settings.backend)
+            probe_slave_real = w.create_variable(w.to_numpy(probe_dtype_ref) * slave_probe_alpha, device=device_obj,
+                                                 requires_grad=True, dtype=dtype_str)
+            probe_slave_imag = w.create_variable(w.to_numpy(probe_imag_ref) * slave_probe_alpha, device=device_obj,
+                                                 requires_grad=True, dtype=dtype_str)
+
+        # ================================================================================
         # Create variables and optimizers for other parameters (probe, probe defocus,
         # probe positions, etc.).
         # ================================================================================
@@ -714,6 +759,10 @@ def reconstruct_ptychography(
 
             optimizable_params['probe_real'] = probe_real
             optimizable_params['probe_imag'] = probe_imag
+            if use_master_slave:
+                optimizable_params['background_map'] = background_map
+                optimizable_params['probe_slave_real'] = probe_slave_real
+                optimizable_params['probe_slave_imag'] = probe_slave_imag
 
             optimizable_params['probe_defocus_mm'] = w.create_variable(0.0)
             optimizable_params['probe_pos_offset'] = w.zeros([n_theta, 2], requires_grad=True, device=device_obj)
@@ -745,6 +794,29 @@ def reconstruct_ptychography(
 
             if optimize_ctf_lg_kappa:
                 optimizable_params['ctf_lg_kappa'] = w.create_variable([ctf_lg_kappa], requires_grad=True, device=device_obj, dtype='float64')
+        elif use_master_slave:
+            dtype_str = w.get_dtype(probe_dtype_ref, backend=global_settings.backend)
+            if 'background_map' not in optimizable_params:
+                optimizable_params['background_map'] = background_map
+            else:
+                optimizable_params['background_map'] = w.create_variable(
+                    w.to_numpy(optimizable_params['background_map']), device=device_obj, requires_grad=True,
+                    dtype=dtype_str)
+            if 'probe_slave_real' not in optimizable_params or 'probe_slave_imag' not in optimizable_params:
+                optimizable_params['probe_slave_real'] = probe_slave_real
+                optimizable_params['probe_slave_imag'] = probe_slave_imag
+            else:
+                optimizable_params['probe_slave_real'] = w.create_variable(
+                    w.to_numpy(optimizable_params['probe_slave_real']), device=device_obj, requires_grad=True,
+                    dtype=dtype_str)
+                optimizable_params['probe_slave_imag'] = w.create_variable(
+                    w.to_numpy(optimizable_params['probe_slave_imag']), device=device_obj, requires_grad=True,
+                    dtype=dtype_str)
+
+        if use_master_slave and not master_slave_init_logged:
+            print_flush('Master-slave tensors N (background) and P_s initialized and registered.',
+                        sto_rank, rank, **stdout_options)
+            master_slave_init_logged = True
 
         opt_ls, opt_args_ls = create_and_initialize_parameter_optimizers(optimizable_params, locals())
 
