@@ -190,6 +190,13 @@ def reconstruct_ptychography(
            even if minibatch_size is 1. In shared_file_mode, all ranks process data from the same rotation
            angle in each synchronized batch. Doing this will cause all ranks to process the same data.
            To perform large fullfield reconstruction efficiently, divide the data into sub-chunks.
+        5. Supplying ``background_data`` (a TIFF stack path or NumPy array shaped ``(n_bg, y, x)`` or
+           a single ``(y, x)`` frame) enables master–slave mode. The loader normalizes the stack by its
+           global mean, logs basic statistics, and uses the mean to initialize a learnable background map
+           that is padded/cropped to the object grid. In standard (non-distributed) runs the background map
+           is sliced per probe patch and propagated as a slave object with its own probe before being
+           coherently summed with the master exit wave. In distributed mode the background map must carry
+           a leading batch dimension to match the distributed tiles.
     """
 
     t_zero = time.time()
