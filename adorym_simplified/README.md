@@ -1,38 +1,38 @@
 ## adorym_simplified
 
-This folder contains a dependency-free reduction of the `demos/2d_ptychography_experimental_data.py` workflow.
-The original repository depends on NumPy, Torch, h5py, and dxchange; these are not available in the execution
-environment, so the reduction implements the core ptychography loop using only Python's standard library.
+A slim, self-contained extraction of the original Adorym
+`demos/2d_ptychography_experimental_data.py` workflow. The script keeps the same
+user-facing parameters but routes all functionality through the `adorym_slim`
+namespace to avoid importing the full `adorym` package.
 
 ### Layout
 
-- `adorym_slim/`: minimal package exposing `reconstruct_ptychography` and a tiny Adam optimizer.
-- `demos/2d_ptychography_experimental_data.py`: drop-in replacement for the original demo that imports from `adorym_slim`.
-- `data/ptycho_synthetic.json`: small synthetic diffraction dataset used for the example run.
-- `verify_against_original.py`: runs the simplified reconstruction twice and checks for numerical agreement.
+- `adorym_slim/`: minimal package with NumPy-only forward/adjoint operators and Adam optimizers.
+- `demos/2d_ptychography_experimental_data.py`: entrypoint mirroring the original demo with a no-`adorym` guard.
+- `data/ptycho_synthetic.json`: bundled fallback dataset used when the referenced HDF5 is absent.
+- `checkpoints/import_audit.py`: static import graph checker that fails if external `adorym` is referenced.
+- `checkpoints/symbol_audit.md`: mapping between imported symbols and their simplified implementations.
+- `verify_against_original.py`: deterministic replay to ensure repeatability within the slim stack.
 
 ### Running the demo
 
-```bash
-python adorym_simplified/demos/2d_ptychography_experimental_data.py --epochs 3
-```
-
-The script writes object and probe estimates into `adorym_simplified/outputs/` as JSON files containing
-complex values. GPU and MPI execution are not available in this trimmed build; everything runs on CPU through
-pure Python.
-
-### Verification
-
-To confirm reproducibility:
+From the repository root:
 
 ```bash
-python adorym_simplified/verify_against_original.py
+python adorym_simplified/demos/2d_ptychography_experimental_data.py --epoch None --save_path cone_256_foam_ptycho --output_folder test
 ```
 
-This executes two reconstructions with identical seeds and reports relative errors between the results.
-Because both runs share the same backend, the tolerance is extremely tight (1e-6). A site-packages
-installation of `adorym` is explicitly rejected to guarantee isolation.
+Notes:
+- The demo inserts `adorym_simplified/` onto `sys.path`; it will warn if a site-packages `adorym` is present.
+- If the target HDF5 (`save_path`/`fname`) is missing, the bundled JSON dataset is used instead.
+- Intermediate reconstructions are written under `save_path/output_folder/`, with NumPy and (optionally) TIFF outputs.
 
 ### Requirements
 
-No external pip dependencies are required beyond the Python standard library.
+Install the minimal dependencies:
+
+```bash
+pip install -r adorym_simplified/requirements_min.txt
+```
+
+Required packages: `numpy`, `h5py`, `dxchange` (for checkpoint I/O). GPU and MPI code paths are intentionally removed.
