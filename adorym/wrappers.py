@@ -1009,8 +1009,21 @@ def pad(var, pad_len, mode='constant', constant_values=0, backend='autograd'):
         else:
             var_device = var_tensor.device
             var_tensor = var_tensor.to(var_device)
-        # Ensure the tensor has at least 4 dims so PyTorch replicate/reflect modes are supported.
         pad_pairs = [tuple(y) for y in pad_len]
+        if mode != 'constant' and var_tensor.dim() > 5:
+            non_zero_dims = [i for i, p in enumerate(pad_pairs) if p != (0, 0)]
+            if len(non_zero_dims) == 2 and non_zero_dims == [var_tensor.dim() - 2, var_tensor.dim() - 1]:
+                spatial_pad_pairs = pad_pairs[-2:]
+                var_flat = var_tensor.reshape(-1, 1, var_tensor.shape[-2], var_tensor.shape[-1])
+                pad_pairs_flat = [(0, 0), (0, 0), *spatial_pad_pairs]
+                pad_len_flat = [x for y in pad_pairs_flat[::-1] for x in y]
+                padded = tc.nn.functional.pad(var_flat, pad_len_flat, mode=mode_dict[mode][backend],
+                                              value=constant_values)
+                return padded.reshape(*var_tensor.shape[:-2], padded.shape[-2], padded.shape[-1])
+            else:
+                raise NotImplementedError('Non-constant padding for tensors with more than 5 dimensions is only '
+                                          'supported when padding is applied to the last two dimensions.')
+        # Ensure the tensor has at least 4 dims so PyTorch replicate/reflect modes are supported.
         target_dim = builtins.max(4, var_tensor.dim())
         if len(pad_pairs) < target_dim:
             pad_pairs = [(0, 0)] * (target_dim - len(pad_pairs)) + pad_pairs
