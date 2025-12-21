@@ -233,6 +233,15 @@ def reconstruct_ptychography(
     if use_master_slave:
         print_flush('Master-slave mode enabled with background data: {}'.format(background_data),
                     sto_rank, rank, **stdout_options)
+        bg_stack, bg_mean = load_background_data(background_data)
+        print_flush(
+            'Background stack loaded. shape: {}; dtype: {}; min: {:.6g}; max: {:.6g}; mean: {:.6g}'.format(
+                bg_stack.shape, bg_stack.dtype, float(bg_stack.min()), float(bg_stack.max()), float(bg_stack.mean())
+            ),
+            0, rank, **stdout_options)
+    else:
+        bg_stack = None
+        bg_mean = None
 
     # ================================================================================
     # Create pointer for raw data.

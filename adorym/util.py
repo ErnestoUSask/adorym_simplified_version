@@ -186,6 +186,66 @@ def initialize_object_for_do(this_obj_size, slice_catalog=None, ds_level=1, obje
     return obj_delta.astype(dtype), obj_beta.astype(dtype)
 
 
+def load_background_data(background_data, normalize=True):
+    """
+    Load and normalize background data for master-slave mode.
+
+    Parameters
+    ----------
+    background_data : str or numpy.ndarray
+        Path to a TIFF stack on disk or an in-memory NumPy array.
+    normalize : bool, optional
+        If True (default), divide the stack by its global mean.
+
+    Returns
+    -------
+    tuple
+        (bg_stack, bg_mean) where ``bg_stack`` is a float32 array of shape
+        (n_bg, y, x) and ``bg_mean`` is the pre-normalization global mean.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the provided TIFF path does not exist.
+    TypeError
+        If the input is neither a string path nor a NumPy array.
+    ValueError
+        If the array dimensions are invalid or contain no data.
+    """
+
+    if isinstance(background_data, str):
+        if not os.path.exists(background_data):
+            raise FileNotFoundError("Background TIFF stack not found at '{}'.".format(background_data))
+        bg_stack = dxchange.read_tiff(background_data)
+    elif isinstance(background_data, np.ndarray):
+        bg_stack = background_data
+    else:
+        raise TypeError('Background data must be a TIFF stack path or a NumPy array.')
+
+    bg_stack = np.asarray(bg_stack)
+
+    if bg_stack.ndim == 2:
+        bg_stack = bg_stack[None, ...]
+    elif bg_stack.ndim != 3:
+        raise ValueError('Background data must have shape (n_bg, y, x); got ndim {}.'.format(bg_stack.ndim))
+
+    if np.prod(bg_stack.shape) == 0 or bg_stack.shape[0] < 1:
+        raise ValueError('Background stack is empty; expected at least one frame, got shape {}.'.format(bg_stack.shape))
+
+    bg_stack = bg_stack.astype('float32', copy=False)
+    bg_mean = float(bg_stack.mean(dtype=np.float64))
+    if not np.isfinite(bg_mean):
+        raise ValueError('Background stack mean is not finite; got {}.'.format(bg_mean))
+
+    if normalize:
+        if bg_mean <= 0:
+            raise ValueError('Background stack mean must be positive to normalize; got {}.'.format(bg_mean))
+        bg_stack = bg_stack / bg_mean
+        bg_stack = bg_stack.astype('float32', copy=False)
+
+    return bg_stack, bg_mean
+
+
 def generate_gaussian_map(size, mag_max, mag_sigma, phase_max, phase_sigma):
     py = np.arange(size[0]) - (size[0] - 1.) / 2
     px = np.arange(size[1]) - (size[1] - 1.) / 2
