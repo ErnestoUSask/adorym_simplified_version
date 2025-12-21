@@ -176,7 +176,8 @@ def create_summary(save_path, locals_dict, var_list=None, preset=None, verbose=T
     return
 
 
-def save_checkpoint(i_epoch, i_batch, output_folder, distribution_mode=None, obj_array=None, optimizer=None):
+def save_checkpoint(i_epoch, i_batch, output_folder, distribution_mode=None, obj_array=None, optimizer=None,
+                   master_slave_state=None):
 
     path = os.path.join(output_folder, 'checkpoint')
     np.savetxt(os.path.join(path, 'checkpoint.txt'),
@@ -192,6 +193,12 @@ def save_checkpoint(i_epoch, i_batch, output_folder, distribution_mode=None, obj
             optimizer.save_distributed_param_arrays_to_checkpoint()
     else:
         pass
+    if master_slave_state is not None:
+        state_to_save = {'use_master_slave': master_slave_state.get('use_master_slave', False)}
+        for k in ['background_map', 'probe_slave_real', 'probe_slave_imag']:
+            if master_slave_state.get(k) is not None:
+                state_to_save[k] = master_slave_state[k]
+        np.savez(os.path.join(path, 'master_slave_state.npz'), **state_to_save)
     return
 
 
@@ -199,16 +206,27 @@ def restore_checkpoint(output_folder, distribution_mode=None, optimizer=None, dt
 
     path = os.path.join(output_folder, 'checkpoint')
     i_epoch, i_batch = [int(i) for i in np.loadtxt(os.path.join(path, 'checkpoint.txt'))]
+    master_slave_state = None
+    ms_state_path = os.path.join(path, 'master_slave_state.npz')
+    if os.path.exists(ms_state_path):
+        with np.load(ms_state_path, allow_pickle=True) as f:
+            master_slave_state = {}
+            for k in f.files:
+                v = f[k]
+                if isinstance(v, np.ndarray) and v.shape == ():
+                    master_slave_state[k] = v.item()
+                else:
+                    master_slave_state[k] = v
     if distribution_mode is None:
         obj = np.load(os.path.join(path, 'obj_checkpoint.npy'))
         optimizer.restore_param_arrays_from_checkpoint()
-        return i_epoch, i_batch, obj
+        return i_epoch, i_batch, obj, master_slave_state
     elif distribution_mode == 'distributed_object':
         obj = np.load(os.path.join(path, 'obj_checkpoint_rank_{}.npy'.format(rank)))
         optimizer.restore_distributed_param_arrays_from_checkpoint(use_numpy=True, dtype=dtype)
-        return i_epoch, i_batch, obj
+        return i_epoch, i_batch, obj, master_slave_state
     elif distribution_mode == 'shared_file':
-        return i_epoch, i_batch
+        return i_epoch, i_batch, None, master_slave_state
 
 
 def parse_source_folder(src_dir, prefix):

@@ -778,9 +778,16 @@ def apply_gradient_gd(x, g, step_size=0.001, dynamic_rate=True, i_batch=0, first
 
 def load_params_checkpoint(path):
     f_pcp = open(path, 'rb')
-    a = pickle.load(f_pcp)
+    checkpoint = pickle.load(f_pcp)
     f_pcp.close()
-    return a
+    master_slave_state = None
+    use_master_slave = False
+    params = checkpoint
+    if isinstance(checkpoint, dict) and 'params' in checkpoint:
+        master_slave_state = checkpoint.get('master_slave_state')
+        use_master_slave = checkpoint.get('use_master_slave', False)
+        params = checkpoint['params']
+    return params, master_slave_state, use_master_slave
 
 
 def save_params_checkpoint(path, params):

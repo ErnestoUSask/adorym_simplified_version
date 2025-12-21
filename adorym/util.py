@@ -2088,6 +2088,20 @@ def output_probe(probe_real, probe_imag, output_folder, full_output=True, ds_lev
                         fname=os.path.join(output_folder, fname1), dtype='float32', overwrite=True)
 
 
+def output_master_slave(noise, probe_slave_real, probe_slave_imag, output_folder, full_output=True, ds_level=1,
+                        i_epoch=0, i_batch=0, save_history=True):
+
+    if noise is not None:
+        if full_output:
+            noise_name = 'N_ds_{}'.format(ds_level)
+        else:
+            noise_name = 'N_{}_{}'.format(i_epoch, i_batch) if save_history else 'N'
+        dxchange.write_tiff(w.to_numpy(noise), os.path.join(output_folder, noise_name), dtype='float32', overwrite=True)
+    if probe_slave_real is not None and probe_slave_imag is not None:
+        output_probe(probe_slave_real, probe_slave_imag, output_folder, full_output=full_output, ds_level=ds_level,
+                     i_epoch=i_epoch, i_batch=i_batch, save_history=save_history, custom_name='probe_slave')
+
+
 def get_subdividing_params(image_shape, n_blocks_y, n_blocks_x, **kwargs):
     """
     Calculate block arrangement and locations when a large 2D image is to be divided into square sub-blocks.

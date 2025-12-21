@@ -494,15 +494,19 @@ def reconstruct_ptychography(
         # Get checkpointed parameters.
         # ================================================================================
         starting_epoch, starting_batch = (0, 0)
+        checkpoint_master_slave_state = None
+        params_master_slave_state = None
+        checkpoint_use_master_slave = False
         needs_initialize = False if use_checkpoint else True
         if use_checkpoint:
             try:
-                optimizable_params = load_params_checkpoint(os.path.join(output_folder, 'checkpoint', 'params_{}'.format(rank)))
+                optimizable_params, params_master_slave_state, checkpoint_use_master_slave = load_params_checkpoint(
+                    os.path.join(output_folder, 'checkpoint', 'params_{}'.format(rank)))
             except:
                 optimizable_params = None
             if distribution_mode == 'shared_file':
                 try:
-                    starting_epoch, starting_batch = restore_checkpoint(output_folder, distribution_mode)
+                    starting_epoch, starting_batch, _, checkpoint_master_slave_state = restore_checkpoint(output_folder, distribution_mode)
                 except:
                     if force_to_use_checkpoint:
                         raise sys.exc_info()
@@ -510,7 +514,7 @@ def reconstruct_ptychography(
 
             elif distribution_mode != 'shared_file':
                 try:
-                    starting_epoch, starting_batch, obj_arr = restore_checkpoint(output_folder, distribution_mode, opt, dtype=cache_dtype)
+                    starting_epoch, starting_batch, obj_arr, checkpoint_master_slave_state = restore_checkpoint(output_folder, distribution_mode, opt, dtype=cache_dtype)
                 except:
                     if distribution_mode == 'distributed_object':
                         if rank < obj_size[0] and force_to_use_checkpoint:
@@ -520,9 +524,26 @@ def reconstruct_ptychography(
         else:
             optimizable_params = None
         
+        def merge_master_slave_states(primary, secondary):
+            if primary is None:
+                return secondary
+            if secondary is None:
+                return primary
+            merged = dict(primary)
+            for k, v in secondary.items():
+                if k not in merged or merged[k] is None:
+                    merged[k] = v
+            return merged
+
+        master_slave_state = merge_master_slave_states(params_master_slave_state, checkpoint_master_slave_state)
+        ms_flag = master_slave_state.get('use_master_slave', False) if isinstance(master_slave_state, dict) else False
+        checkpoint_use_master_slave = checkpoint_use_master_slave or ms_flag
+        use_master_slave = use_master_slave or checkpoint_use_master_slave
+
         needs_initialize = comm.bcast(needs_initialize, root=0)
         starting_epoch = comm.bcast(starting_epoch, root=0)
         starting_batch = comm.bcast(starting_batch, root=0)
+        use_master_slave = comm.bcast(use_master_slave, root=0)
 
         # ================================================================================
         # Create object class.
@@ -727,16 +748,32 @@ def reconstruct_ptychography(
         background_map = None
         probe_slave_real = None
         probe_slave_imag = None
+        restored_background = None
+        restored_probe_slave_real = None
+        restored_probe_slave_imag = None
+        if isinstance(master_slave_state, dict):
+            restored_background = master_slave_state.get('background_map')
+            restored_probe_slave_real = master_slave_state.get('probe_slave_real')
+            restored_probe_slave_imag = master_slave_state.get('probe_slave_imag')
         if use_master_slave:
             detector_shape = prj_shape[-2:]
             target_shape = this_obj_size[:2]
             dtype_str = w.get_dtype(probe_dtype_ref, backend=global_settings.backend)
-            background_map = initialize_background_map_from_mean(bg_mean, detector_shape, target_shape, dtype_str,
-                                                                 device_obj, global_settings.backend)
-            probe_slave_real = w.create_variable(w.to_numpy(probe_dtype_ref) * slave_probe_alpha, device=device_obj,
-                                                 requires_grad=True, dtype=dtype_str)
-            probe_slave_imag = w.create_variable(w.to_numpy(probe_imag_ref) * slave_probe_alpha, device=device_obj,
-                                                 requires_grad=True, dtype=dtype_str)
+            if restored_background is not None:
+                background_map = w.create_variable(restored_background, device=device_obj, requires_grad=True, dtype=dtype_str)
+            else:
+                background_map = initialize_background_map_from_mean(bg_mean, detector_shape, target_shape, dtype_str,
+                                                                     device_obj, global_settings.backend)
+            if restored_probe_slave_real is not None:
+                probe_slave_real = w.create_variable(restored_probe_slave_real, device=device_obj, requires_grad=True, dtype=dtype_str)
+            else:
+                probe_slave_real = w.create_variable(w.to_numpy(probe_dtype_ref) * slave_probe_alpha, device=device_obj,
+                                                     requires_grad=True, dtype=dtype_str)
+            if restored_probe_slave_imag is not None:
+                probe_slave_imag = w.create_variable(restored_probe_slave_imag, device=device_obj, requires_grad=True, dtype=dtype_str)
+            else:
+                probe_slave_imag = w.create_variable(w.to_numpy(probe_imag_ref) * slave_probe_alpha, device=device_obj,
+                                                     requires_grad=True, dtype=dtype_str)
 
         # ================================================================================
         # Create variables and optimizers for other parameters (probe, probe defocus,
@@ -809,15 +846,25 @@ def reconstruct_ptychography(
                 optimizable_params['ctf_lg_kappa'] = w.create_variable([ctf_lg_kappa], requires_grad=True, device=device_obj, dtype='float64')
         elif use_master_slave:
             dtype_str = w.get_dtype(probe_dtype_ref, backend=global_settings.backend)
-            if 'background_map' not in optimizable_params:
+            if background_map is not None:
                 optimizable_params['background_map'] = background_map
+            elif 'background_map' not in optimizable_params:
+                optimizable_params['background_map'] = initialize_background_map_from_mean(
+                    bg_mean, prj_shape[-2:], this_obj_size[:2], dtype_str, device_obj, global_settings.backend)
             else:
                 optimizable_params['background_map'] = w.create_variable(
                     w.to_numpy(optimizable_params['background_map']), device=device_obj, requires_grad=True,
                     dtype=dtype_str)
-            if 'probe_slave_real' not in optimizable_params or 'probe_slave_imag' not in optimizable_params:
+            if probe_slave_real is not None and probe_slave_imag is not None:
                 optimizable_params['probe_slave_real'] = probe_slave_real
                 optimizable_params['probe_slave_imag'] = probe_slave_imag
+            elif 'probe_slave_real' not in optimizable_params or 'probe_slave_imag' not in optimizable_params:
+                optimizable_params['probe_slave_real'] = w.create_variable(
+                    w.to_numpy(probe_dtype_ref) * slave_probe_alpha, device=device_obj, requires_grad=True,
+                    dtype=dtype_str)
+                optimizable_params['probe_slave_imag'] = w.create_variable(
+                    w.to_numpy(probe_imag_ref) * slave_probe_alpha, device=device_obj, requires_grad=True,
+                    dtype=dtype_str)
             else:
                 optimizable_params['probe_slave_real'] = w.create_variable(
                     w.to_numpy(optimizable_params['probe_slave_real']), device=device_obj, requires_grad=True,
@@ -979,21 +1026,28 @@ def reconstruct_ptychography(
                 # Save checkpoint.
                 # ================================================================================
                 if store_checkpoint and i_batch % n_batch_per_checkpoint == 0:
+                    cp_path = os.path.join(output_folder, 'checkpoint')
+                    create_directory_multirank(cp_path)
+                    master_slave_state_to_save = {'use_master_slave': use_master_slave}
+                    if use_master_slave:
+                        master_slave_state_to_save['background_map'] = w.to_numpy(
+                            optimizable_params.get('background_map')) if optimizable_params.get('background_map') is not None else None
+                        master_slave_state_to_save['probe_slave_real'] = w.to_numpy(
+                            optimizable_params.get('probe_slave_real')) if optimizable_params.get('probe_slave_real') is not None else None
+                        master_slave_state_to_save['probe_slave_imag'] = w.to_numpy(
+                            optimizable_params.get('probe_slave_imag')) if optimizable_params.get('probe_slave_imag') is not None else None
+                    params_payload = {'params': optimizable_params, 'use_master_slave': use_master_slave}
+                    if master_slave_state_to_save is not None:
+                        params_payload['master_slave_state'] = master_slave_state_to_save
                     if distribution_mode == 'shared_file':
                         obj.f.flush()
                         obj_arr = None
                     else:
-                        if obj.arr is not None:
-                            obj_arr = w.to_numpy(obj.arr)
-                        else:
-                            obj_arr = None
-                        cp_path = os.path.join(output_folder, 'checkpoint')
-                        create_directory_multirank(cp_path)
-                        if (distribution_mode is None and rank == 0) or (distribution_mode is not None):
-                            if obj_arr is not None:
-                                save_checkpoint(i_epoch, i_batch, output_folder, distribution_mode=distribution_mode,
-                                                obj_array=obj_arr, optimizer=opt)
-                            save_params_checkpoint(os.path.join(cp_path, 'params_{}'.format(rank)), optimizable_params)
+                        obj_arr = w.to_numpy(obj.arr) if obj.arr is not None else None
+                    if (distribution_mode is None and rank == 0) or (distribution_mode is not None):
+                        save_checkpoint(i_epoch, i_batch, output_folder, distribution_mode=distribution_mode,
+                                        obj_array=obj_arr, optimizer=opt, master_slave_state=master_slave_state_to_save)
+                        save_params_checkpoint(os.path.join(cp_path, 'params_{}'.format(rank)), params_payload)
                 comm.Barrier()
 
                 # ================================================================================
@@ -1349,12 +1403,26 @@ def reconstruct_ptychography(
                         output_object(obj, distribution_mode, os.path.join(output_folder, 'intermediate', 'object'),
                                       unknown_type, full_output=False, i_epoch=i_epoch, i_batch=i_batch,
                                       save_history=save_history)
+                        if use_master_slave:
+                            output_master_slave(optimizable_params.get('background_map'),
+                                                optimizable_params.get('probe_slave_real'),
+                                                optimizable_params.get('probe_slave_imag'),
+                                                os.path.join(output_folder, 'intermediate', 'object'),
+                                                full_output=False, i_epoch=i_epoch, i_batch=i_batch,
+                                                save_history=save_history)
                         output_intermediate_parameters(opt_ls, optimizable_params, locals())
                     elif distribution_mode == 'distributed_object' and is_last_batch_of_this_theta:
                         output_object(obj, distribution_mode, os.path.join(output_folder, 'intermediate', 'object'),
                                       unknown_type, full_output=False, i_epoch=i_epoch, i_batch=i_batch,
                                       save_history=save_history)
                         if rank == 0:
+                            if use_master_slave:
+                                output_master_slave(optimizable_params.get('background_map'),
+                                                    optimizable_params.get('probe_slave_real'),
+                                                    optimizable_params.get('probe_slave_imag'),
+                                                    os.path.join(output_folder, 'intermediate', 'object'),
+                                                    full_output=False, i_epoch=i_epoch, i_batch=i_batch,
+                                                    save_history=save_history)
                             output_intermediate_parameters(opt_ls, optimizable_params, locals())
                 comm.Barrier()
 
@@ -1417,5 +1485,10 @@ def reconstruct_ptychography(
                               full_output=True, ds_level=ds_level)
                 output_probe(optimizable_params['probe_real'], optimizable_params['probe_imag'], output_folder,
                              full_output=True, ds_level=ds_level)
+                if use_master_slave:
+                    output_master_slave(optimizable_params.get('background_map'),
+                                        optimizable_params.get('probe_slave_real'),
+                                        optimizable_params.get('probe_slave_imag'),
+                                        output_folder, full_output=True, ds_level=ds_level)
             print_flush('Current iteration finished.', sto_rank, rank, **stdout_options)
         w.barrier(comm)
