@@ -230,6 +230,7 @@ def reconstruct_ptychography(
     print_flush('Output folder is {}'.format(output_folder), sto_rank, rank, **stdout_options)
 
     use_master_slave = background_data is not None
+    noise = None
     if use_master_slave:
         print_flush('Master-slave mode enabled with background data: {}'.format(background_data),
                     sto_rank, rank, **stdout_options)
@@ -817,6 +818,9 @@ def reconstruct_ptychography(
             print_flush('Master-slave tensors N (background) and P_s initialized and registered.',
                         sto_rank, rank, **stdout_options)
             master_slave_init_logged = True
+
+        if use_master_slave:
+            noise = optimizable_params['background_map']
 
         opt_ls, opt_args_ls = create_and_initialize_parameter_optimizers(optimizable_params, locals())
 
