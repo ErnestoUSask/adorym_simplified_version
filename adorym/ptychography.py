@@ -190,6 +190,13 @@ def reconstruct_ptychography(
            even if minibatch_size is 1. In shared_file_mode, all ranks process data from the same rotation
            angle in each synchronized batch. Doing this will cause all ranks to process the same data.
            To perform large fullfield reconstruction efficiently, divide the data into sub-chunks.
+        5. Supplying ``background_data`` (a TIFF stack path or NumPy array shaped ``(n_bg, y, x)`` or
+           a single ``(y, x)`` frame) enables master–slave mode. The loader normalizes the stack by its
+           global mean, logs basic statistics, and uses the mean to initialize a learnable background map
+           that is padded/cropped to the object grid. In standard (non-distributed) runs the background map
+           is sliced per probe patch and propagated as a slave object with its own probe before being
+           coherently summed with the master exit wave. In distributed mode the background map must carry
+           a leading batch dimension to match the distributed tiles.
     """
 
     t_zero = time.time()
@@ -374,19 +381,19 @@ def reconstruct_ptychography(
         Create a background map aligned to the object grid. If detector and object sizes differ,
         deterministically pad/crop to the target shape using existing padding utilities.
         """
-        bg_arr = np.full(detector_shape, bg_value, dtype='float32')
-        bg_arr = w.create_variable(bg_arr, device=device, requires_grad=True, dtype=dtype)
+        bg_arr_np = np.full(detector_shape, bg_value, dtype='float32')
         if tuple(detector_shape) != tuple(target_shape):
-            pad_y = max(target_shape[0] - int(bg_arr.shape[0]), 0)
-            pad_x = max(target_shape[1] - int(bg_arr.shape[1]), 0)
+            pad_y = max(target_shape[0] - int(bg_arr_np.shape[0]), 0)
+            pad_x = max(target_shape[1] - int(bg_arr_np.shape[1]), 0)
             if pad_y > 0 or pad_x > 0:
-                pad_cfg = [[pad_y // 2, pad_y - pad_y // 2], [pad_x // 2, pad_x - pad_x // 2]]
-                bg_arr = w.pad(bg_arr, pad_cfg, mode='edge', backend=backend_name)
-            current_shape = bg_arr.shape
+                pad_cfg = ((pad_y // 2, pad_y - pad_y // 2), (pad_x // 2, pad_x - pad_x // 2))
+                bg_arr_np = np.pad(bg_arr_np, pad_cfg, mode='edge')
+            current_shape = bg_arr_np.shape
             if current_shape[0] > target_shape[0] or current_shape[1] > target_shape[1]:
                 start_y = max((int(current_shape[0]) - target_shape[0]) // 2, 0)
                 start_x = max((int(current_shape[1]) - target_shape[1]) // 2, 0)
-                bg_arr = bg_arr[start_y:start_y + target_shape[0], start_x:start_x + target_shape[1]]
+                bg_arr_np = bg_arr_np[start_y:start_y + target_shape[0], start_x:start_x + target_shape[1]]
+        bg_arr = w.create_variable(bg_arr_np, device=device, requires_grad=True, dtype=dtype)
         return bg_arr
 
     for ds_level in range(multiscale_level - 1, -1, -1):
