@@ -955,6 +955,15 @@ def create_and_initialize_parameter_optimizers(optimizable_params, kwargs):
         opt_args_ls.append(forward_model.get_argument_index('ctf_lg_kappa'))
         opt_ls.append(opt_ctf_lg_kappa)
 
+    if kwargs.get('use_master_slave', False):
+        for arg_name in ['noise', 'probe_slave_real', 'probe_slave_imag']:
+            try:
+                arg_index = forward_model.get_argument_index(arg_name)
+            except ValueError:
+                continue
+            if arg_index not in opt_args_ls:
+                opt_args_ls.append(arg_index)
+
     return opt_ls, opt_args_ls
 
 

@@ -1130,6 +1130,17 @@ def reconstruct_ptychography(
                 comm.Barrier()
                 print_flush('  Gradient calculation done in {} s.'.format(time.time() - t_grad_0), sto_rank, rank, **stdout_options)
                 grads = list(grads)
+                if use_master_slave and not forward_model.master_slave_grad_logged:
+                    grad_norms = {'noise': None, 'probe_slave_real': None, 'probe_slave_imag': None}
+                    for g, arg_idx in zip(grads, opt_args_ls):
+                        arg_name = forward_model.argument_ls[arg_idx]
+                        if arg_name in grad_norms and g is not None:
+                            grad_norms[arg_name] = float(w.to_numpy(w.vec_norm(g)))
+                    print_flush(
+                        '  Master-slave gradient norms -> N: {}, P_s_real: {}, P_s_imag: {}.'.format(
+                            grad_norms['noise'], grad_norms['probe_slave_real'], grad_norms['probe_slave_imag']),
+                        sto_rank, rank, **stdout_options)
+                    forward_model.master_slave_grad_logged = True
 
                 # ================================================================================
                 # Save gradients to buffer, or write them to file.
