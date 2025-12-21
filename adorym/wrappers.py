@@ -1002,20 +1002,14 @@ def pad(var, pad_len, mode='constant', constant_values=0, backend='autograd'):
     if backend == 'autograd':
         return anp.pad(var, pad_len, mode=mode_dict[mode][backend], **args)
     elif backend == 'pytorch':
-        var_tensor = var
-        if not tc.is_tensor(var_tensor):
-            var_tensor = tc.as_tensor(var_tensor)
-        else:
-            var_device = var_tensor.device
-            var_tensor = var_tensor.to(var_device)
         # Ensure the tensor has at least 4 dims so PyTorch replicate/reflect modes are supported.
         pad_pairs = [tuple(y) for y in pad_len]
-        target_dim = max(4, var_tensor.dim())
+        target_dim = max(4, var.dim())
         if len(pad_pairs) < target_dim:
             pad_pairs = [(0, 0)] * (target_dim - len(pad_pairs)) + pad_pairs
         pad_len_flat = [x for y in pad_pairs[::-1] for x in y]
-        var_expanded = var_tensor
-        expand_dims = target_dim - var_tensor.dim()
+        var_expanded = var
+        expand_dims = target_dim - var.dim()
         for _ in range(expand_dims):
             var_expanded = var_expanded.unsqueeze(0)
         padded = tc.nn.functional.pad(var_expanded, pad_len_flat, mode=mode_dict[mode][backend], value=constant_values)
