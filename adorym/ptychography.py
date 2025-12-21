@@ -55,7 +55,7 @@ def reconstruct_ptychography(
         # ______________________________________
         # |Raw data and experimental parameters|________________________________
         fname, obj_size, probe_pos=None, theta_st=0, theta_end=PI, n_theta=None, theta_downsample=None,
-        energy_ev=None, psize_cm=None, free_prop_cm=None,
+        energy_ev=None, psize_cm=None, free_prop_cm=None, background_data=None,
         raw_data_type='magnitude', # Choose from 'magnitude' or 'intensity'
         is_minus_logged=False, # Select True if raw data (usually conventional tomography) is minus-logged
         slice_pos_cm_ls=None,
@@ -228,6 +228,11 @@ def reconstruct_ptychography(
                       'timestamp': timestr}
     sto_rank = 0 if not debug else rank
     print_flush('Output folder is {}'.format(output_folder), sto_rank, rank, **stdout_options)
+
+    use_master_slave = background_data is not None
+    if use_master_slave:
+        print_flush('Master-slave mode enabled with background data: {}'.format(background_data),
+                    sto_rank, rank, **stdout_options)
 
     # ================================================================================
     # Create pointer for raw data.
