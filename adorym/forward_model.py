@@ -182,6 +182,7 @@ class PtychographyModel(ForwardModel):
         self.master_slave_patch_shape_logged = False
         self.master_slave_activation_logged = False
         self.master_slave_grad_logged = False
+        self.master_slave_padding_logged = False
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
@@ -310,6 +311,10 @@ class PtychographyModel(ForwardModel):
             obj_rot, pad_arr = pad_object(obj_rot, this_obj_size, this_pos_batch, probe_size, unknown_type=unknown_type)
             if use_master_slave and noise is not None:
                 pad_cfg = [[0, 0]] * (len(noise.shape) - 2) + pad_arr.tolist()
+                if not self.master_slave_padding_logged:
+                    print_flush('Master-slave padding -> pad_cfg: {}; noise shape: {}; pad_arr: {}.'.format(
+                        pad_cfg, tuple(noise.shape), pad_arr.tolist()), 0, rank, **stdout_options)
+                    self.master_slave_padding_logged = True
                 if np.count_nonzero(pad_arr) > 0:
                     noise = w.pad(noise, pad_cfg, mode='edge')
 
