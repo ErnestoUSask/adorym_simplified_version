@@ -1493,9 +1493,12 @@ def total_variation_3d(arr, axis_offset=0):
     arr_size = 1
     for i in range(len(arr.shape)):
         arr_size = arr_size * arr.shape[i]
-    res = w.sum(w.abs(w.roll(arr, 1, axes=0 + axis_offset) - arr))
-    res = res + w.sum(w.abs(w.roll(arr, 1, axes=1 + axis_offset) - arr))
-    res = res + w.sum(w.abs(w.roll(arr, 1, axes=2 + axis_offset) - arr))
+    axes = [ax for ax in range(axis_offset, min(arr.ndim, axis_offset + 3))]
+    if len(axes) == 0:
+        return w.create_variable(0., device=w.get_var_device(arr))
+    for i, ax in enumerate(axes):
+        term = w.sum(w.abs(w.roll(arr, 1, axes=ax) - arr))
+        res = term if i == 0 else res + term
     res = res / arr_size
     return res
 
