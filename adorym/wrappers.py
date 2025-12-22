@@ -1023,6 +1023,16 @@ def pad(var, pad_len, mode='constant', constant_values=0, backend='autograd'):
             else:
                 raise NotImplementedError('Non-constant padding for tensors with more than 5 dimensions is only '
                                           'supported when padding is applied to the last two dimensions.')
+        if mode != 'constant':
+            # Torch only supports replicate/reflect/circular on 3D–5D tensors. Flatten everything
+            # except the spatial axes so padding is always applied in 2D on a 4D tensor.
+            spatial_pad_pairs = pad_pairs[-2:] if len(pad_pairs) >= 2 else [(0, 0), (0, 0)]
+            pad_len_flat = [spatial_pad_pairs[-1][0], spatial_pad_pairs[-1][1],
+                            spatial_pad_pairs[-2][0], spatial_pad_pairs[-2][1]]
+            var_flat = var_tensor.reshape(-1, 1, var_tensor.shape[-2], var_tensor.shape[-1])
+            padded = tc.nn.functional.pad(var_flat, pad_len_flat, mode=mode_dict[mode][backend],
+                                          value=constant_values)
+            return padded.reshape(*var_tensor.shape[:-2], padded.shape[-2], padded.shape[-1])
         # Ensure the tensor has at least 4 dims so PyTorch replicate/reflect modes are supported.
         target_dim = builtins.max(4, var_tensor.dim())
         if len(pad_pairs) < target_dim:
