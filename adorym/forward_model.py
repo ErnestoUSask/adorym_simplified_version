@@ -68,7 +68,9 @@ class ForwardModel(object):
         self.reg_list = []
 
     def update_loss_args(self, kwargs):
-        self.loss_args = kwargs
+        # ``obj`` is passed separately to ``get_regularization_value``; removing it from the
+        # saved loss arguments prevents duplicate values when the kwargs are expanded.
+        self.loss_args = {k: v for k, v in kwargs.items() if k != 'obj'}
 
     def add_regularizers(self, reg_list):
         self.reg_list = reg_list
