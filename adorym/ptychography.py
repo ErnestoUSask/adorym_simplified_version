@@ -56,6 +56,7 @@ def reconstruct_ptychography(
         # |Raw data and experimental parameters|________________________________
         fname, obj_size, probe_pos=None, theta_st=0, theta_end=PI, n_theta=None, theta_downsample=None,
         energy_ev=None, psize_cm=None, free_prop_cm=None, background_data=None,
+        background_data_type='detector_intensity',
         background_tv_weight=1e-7, probe_slave_ratio_weight=1e-3, probe_slave_max_ratio=0.2,
         background_mean_pull_weight=None, regularizer_log_interval=1,
         raw_data_type='magnitude', # Choose from 'magnitude' or 'intensity'
@@ -191,13 +192,17 @@ def reconstruct_ptychography(
            angle in each synchronized batch. Doing this will cause all ranks to process the same data.
            To perform large fullfield reconstruction efficiently, divide the data into sub-chunks.
         5. Supplying ``background_data`` (a TIFF stack path or NumPy array shaped ``(n_bg, y, x)`` or
-           a single ``(y, x)`` frame) enables master–slave mode. The loader normalizes the stack by its
+           a single ``(y, x)`` frame) enables master–slave mode. By default, the data are assumed to be
+           detector-plane **intensities** and are square-rooted before normalization so the learned
+           background map ``N`` starts in transmission-magnitude units. Set ``background_data_type`` to
+           ``'object_transmission'`` if you provide already-propagated transmission magnitudes; negative
+           values will raise an error to prevent accidental misuse. The loader normalizes the stack by its
            global mean, logs basic statistics, and uses a per-pixel statistic across the stack (mean by
            default) to initialize a learnable background map that is padded/cropped to the object grid.
            In standard (non-distributed) runs the background map is sliced per probe patch and propagated
-           as a slave object with its own probe before being
-           coherently summed with the master exit wave. In distributed mode the background map must carry
-           a leading batch dimension to match the distributed tiles.
+           as a slave object with its own probe before being coherently summed with the master exit wave.
+           In distributed mode the background map must carry a leading batch dimension to match the
+           distributed tiles.
     """
 
     t_zero = time.time()
@@ -239,12 +244,17 @@ def reconstruct_ptychography(
     sto_rank = 0 if not debug else rank
     print_flush('Output folder is {}'.format(output_folder), sto_rank, rank, **stdout_options)
 
+    valid_background_data_types = ('detector_intensity', 'object_transmission')
+    if background_data_type not in valid_background_data_types:
+        raise ValueError('background_data_type must be one of {}.'.format(valid_background_data_types))
+
     use_master_slave = background_data is not None
     noise = None
     if use_master_slave:
         print_flush('Master-slave mode enabled with background data: {}'.format(background_data),
                     sto_rank, rank, **stdout_options)
-        bg_stack, bg_mean_model, bg_scale_factor = load_background_data(background_data)
+        bg_stack, bg_mean_model, bg_scale_factor = load_background_data(
+            background_data, background_data_type=background_data_type)
         print_flush(
             'Background stack loaded. shape: {}; dtype: {}; min: {:.6g}; max: {:.6g}; mean: {:.6g}; '
             'scale_factor(raw->model): {:.6g}'.format(
@@ -414,7 +424,7 @@ def reconstruct_ptychography(
         bg_arr = w.create_variable(bg_arr_np, device=device, requires_grad=True, dtype=dtype)
         return bg_arr
 
-    def initialize_background_map_from_stack(bg_stack_arr, target_shape, dtype, device, backend_name, raw_data_type,
+    def initialize_background_map_from_stack(bg_stack_arr, target_shape, dtype, device, backend_name,
                                              return_mean=False):
         """
         Initialize the background map using per-pixel statistics from the supplied stack.
@@ -425,8 +435,6 @@ def reconstruct_ptychography(
             bg_arr_np = np.mean(bg_stack_arr, axis=0)
         else:
             bg_arr_np = np.squeeze(bg_stack_arr)
-        if raw_data_type == 'intensity':
-            bg_arr_np = np.sqrt(np.clip(bg_arr_np, a_min=0.0, a_max=None))
         bg_arr_np = pad_or_crop_background(bg_arr_np.astype('float32', copy=False), target_shape)
         bg_arr_mean = float(bg_arr_np.mean(dtype=np.float64))
         bg_arr = w.create_variable(bg_arr_np, device=device, requires_grad=True, dtype=dtype)
@@ -434,15 +442,13 @@ def reconstruct_ptychography(
             return bg_arr, bg_arr_mean
         return bg_arr
 
-    def compute_background_target_mean(bg_stack_arr, target_shape, raw_data_type):
+    def compute_background_target_mean(bg_stack_arr, target_shape):
         if bg_stack_arr is None:
             return None
         if bg_stack_arr.ndim == 3:
             bg_arr_np = np.mean(bg_stack_arr, axis=0)
         else:
             bg_arr_np = np.squeeze(bg_stack_arr)
-        if raw_data_type == 'intensity':
-            bg_arr_np = np.sqrt(np.clip(bg_arr_np, a_min=0.0, a_max=None))
         bg_arr_np = pad_or_crop_background(bg_arr_np.astype('float32', copy=False), target_shape)
         return float(bg_arr_np.mean(dtype=np.float64))
 
@@ -469,7 +475,7 @@ def reconstruct_ptychography(
 
         background_target_mean = None
         if use_master_slave:
-            background_target_mean = compute_background_target_mean(bg_stack, this_obj_size[:2], raw_data_type)
+            background_target_mean = compute_background_target_mean(bg_stack, this_obj_size[:2])
             if not background_scale_logged:
                 log_msg = 'Background scale -> factor(raw->model): {:.6g}; target_mean(model): {}'.format(
                     float(bg_scale_factor), background_target_mean)
@@ -832,7 +838,7 @@ def reconstruct_ptychography(
                 background_map = w.create_variable(restored_background, device=device_obj, requires_grad=True, dtype=dtype_str)
             else:
                 background_map = initialize_background_map_from_stack(
-                    bg_stack, target_shape, dtype_str, device_obj, global_settings.backend, raw_data_type)
+                    bg_stack, target_shape, dtype_str, device_obj, global_settings.backend)
             if restored_probe_slave_real is not None:
                 probe_slave_real = w.create_variable(restored_probe_slave_real, device=device_obj, requires_grad=True, dtype=dtype_str)
             else:
@@ -919,7 +925,7 @@ def reconstruct_ptychography(
                 optimizable_params['background_map'] = background_map
             elif 'background_map' not in optimizable_params:
                 optimizable_params['background_map'] = initialize_background_map_from_stack(
-                    bg_stack, this_obj_size[:2], dtype_str, device_obj, global_settings.backend, raw_data_type)
+                    bg_stack, this_obj_size[:2], dtype_str, device_obj, global_settings.backend)
             else:
                 optimizable_params['background_map'] = w.create_variable(
                     w.to_numpy(optimizable_params['background_map']), device=device_obj, requires_grad=True,

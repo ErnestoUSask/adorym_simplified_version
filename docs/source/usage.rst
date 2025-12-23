@@ -26,13 +26,18 @@ Master–slave background mode
 Passing a value to ``background_data`` activates the master–slave
 forward model. The argument can be either a TIFF stack path or a
 ``numpy.ndarray`` with shape ``(n_bg, y, x)`` (a single ``(y, x)`` frame
-is accepted and expanded). The loader normalizes the stack by its global
-mean, logs basic statistics, and initializes a learnable background map
-that is padded/cropped to the object grid before propagation. During
-forward projection, this map is sliced per probe patch and propagated
-with a slave probe before being coherently summed with the master exit
-wave. In distributed mode the background map must include a leading
-batch dimension so each distributed tile receives its own slice.
+is accepted and expanded). By default, ``background_data`` is assumed to
+contain **detector-plane intensities**; the loader square-roots the data
+to obtain field magnitudes, normalizes by the global mean, logs basic
+statistics, and initializes a learnable background map that is
+padded/cropped to the object grid before propagation. If you provide
+object-plane transmission magnitudes directly, set
+``background_data_type=\"object_transmission\"`` to bypass the
+square-root while enforcing non-negative values. During forward
+projection, the map is sliced per probe patch and propagated with a
+slave probe before being coherently summed with the master exit wave.
+In distributed mode the background map must include a leading batch
+dimension so each distributed tile receives its own slice.
 
 Example usage:
 
@@ -46,6 +51,7 @@ Example usage:
         energy_ev=8801.12,
         psize_cm=1.33e-06,
         background_data="bg_stack.tiff",
+        background_data_type="detector_intensity",  # or "object_transmission" if already at the sample plane
         probe_slave_ratio_weight=1e-3,
         probe_slave_max_ratio=0.2,
         two_d_mode=True,

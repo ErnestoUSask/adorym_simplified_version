@@ -141,6 +141,9 @@ for 2D fly-scan ptychography reconstruction with probe position refinement:
     # You can also provide an in-memory NumPy array with shape (n_bg, y, x) or (y, x).
     params_ptych = {"fname": "data.h5",
                     "background_data": "bg_stack.tiff",
+                    # Declare whether the background frames are detector intensities
+                    # (square-rooted automatically) or already sample-plane magnitudes.
+                    "background_data_type": "detector_intensity",
                     "probe_slave_ratio_weight": 1e-3,
                     "probe_slave_max_ratio": 0.2,
                     ...}

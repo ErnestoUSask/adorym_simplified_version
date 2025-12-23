@@ -187,7 +187,8 @@ def initialize_object_for_do(this_obj_size, slice_catalog=None, ds_level=1, obje
 
 
 def load_background_data(background_data, normalize=True, axis_order_hint=None,
-                         transpose_to_standard=True, logger=None):
+                         transpose_to_standard=True, logger=None,
+                         background_data_type='detector_intensity'):
     """
     Load background data for master-slave mode and optionally normalize it.
 
@@ -208,6 +209,12 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
     logger : callable, optional
         Callable used for logging messages. If None, ``print_flush`` is used with
         ``designate_rank=0``.
+    background_data_type : {'detector_intensity', 'object_transmission'}, optional
+        Declare the physical meaning of ``background_data``. ``'detector_intensity'``
+        (default) treats the frames as detector-plane intensities and converts them to
+        magnitudes via square-root before optional normalization. ``'object_transmission'``
+        assumes the data already represent non-negative sample-plane transmission
+        magnitudes and validates accordingly.
 
     Returns
     -------
@@ -254,6 +261,15 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
                 return 'nxy'
         raise ValueError("axis_order_hint must be one of 'nyx', 'nxy', 'yx', 'xy' "
                          "or a 2-tuple/list such as ('y', 'x').")
+
+    def _normalize_background_units(bg_arr):
+        if background_data_type == 'detector_intensity':
+            return np.sqrt(np.clip(bg_arr, a_min=0.0, a_max=None))
+        if background_data_type == 'object_transmission':
+            if np.any(bg_arr < 0):
+                raise ValueError('background_data_type="object_transmission" expects non-negative transmission magnitudes.')
+            return bg_arr
+        raise ValueError('background_data_type must be "detector_intensity" or "object_transmission".')
 
     def _infer_order_from_metadata(path):
         axes_order = None
@@ -321,6 +337,9 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
             _log('Background stack retained in (n, x, y) order (transpose_to_standard=False).')
     else:
         _log('Background stack treated as (n, y, x); no transpose applied.')
+
+    bg_stack = _normalize_background_units(bg_stack)
+    _log('Background data interpreted as {} and converted to model magnitudes.'.format(background_data_type))
 
     bg_stack = bg_stack.astype('float32', copy=False)
     bg_raw_mean = float(bg_stack.mean(dtype=np.float64))
