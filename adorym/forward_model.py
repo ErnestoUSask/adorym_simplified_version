@@ -319,6 +319,16 @@ class PtychographyModel(ForwardModel):
                     self.master_slave_padding_logged = True
                 if np.count_nonzero(pad_arr) > 0:
                     noise = w.pad(noise, pad_cfg, mode='edge')
+        elif use_master_slave and noise is not None:
+            # Ensure distributed-mode background maps carry a batch dimension so they can be sliced
+            # alongside distributed objects.
+            target_batch_dim = obj_rot.shape[0] if hasattr(obj_rot, 'shape') and len(obj_rot.shape) > 0 else len(this_pos_batch)
+            if len(noise.shape) < 3:
+                noise = w.reshape(noise, [1, *noise.shape])
+            if noise.shape[0] < target_batch_dim:
+                repeat_factor = int(np.ceil(target_batch_dim / noise.shape[0]))
+                tile_cfg = [repeat_factor] + [1] * (len(noise.shape) - 1)
+                noise = w.tile(noise, tile_cfg)
 
         pos_ind = 0
         for k, pos_batch in enumerate(probe_pos_batch_ls):
