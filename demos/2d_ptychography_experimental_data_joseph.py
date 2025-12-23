@@ -58,6 +58,14 @@ h5_files = list(h5_files_folder_path.glob("*.h5"))
 
 bg_centered = tifffile.imread(r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\background_centered_1920.tiff")
 
+mag0 = tifffile.imread(
+    r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\probe_abs.tif")
+ph0 = tifffile.imread(
+    r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\probe_angle.tif")
+
+probe_mag_phase = [mag0, ph0]
+probe_mag_phase = np.array(probe_mag_phase)
+
 for h5_path in h5_files:
     with h5py.File(h5_path, "r") as f:
         rec_image_size = f["metadata/reconstruction_size"][()]  # returns a numpy array
@@ -96,12 +104,12 @@ for h5_path in h5_files:
                        'n_dp_batch': 350,
                        # ===============================plane
                        'n_probe_modes': 1,
-                       'probe_type': 'aperture_defocus',
-                       'aperture_radius': 1,
+                       # 'probe_type': 'aperture_defocus',
+                       # 'aperture_radius': 1,
                        # 'beamstop_radius': 25,
-                       'probe_defocus_cm': 0.0046,
-                       # 'probe_type': 'supplied',
-                       # 'probe_initial': probe_mag_phase,
+                       # 'probe_defocus_cm': 0.0046,
+                       'probe_type': 'supplied',
+                       'probe_initial': probe_mag_phase,
                        # ===============================
                        'rescale_probe_intensity': True,
                        'free_prop_cm': 'inf',
