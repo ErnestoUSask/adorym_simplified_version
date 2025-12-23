@@ -782,12 +782,14 @@ def load_params_checkpoint(path):
     f_pcp.close()
     master_slave_state = None
     use_master_slave = False
+    use_dark_bg = False
     params = checkpoint
     if isinstance(checkpoint, dict) and 'params' in checkpoint:
         master_slave_state = checkpoint.get('master_slave_state')
         use_master_slave = checkpoint.get('use_master_slave', False)
+        use_dark_bg = checkpoint.get('use_dark_bg', False)
         params = checkpoint['params']
-    return params, master_slave_state, use_master_slave
+    return params, master_slave_state, use_master_slave, use_dark_bg
 
 
 def save_params_checkpoint(path, params):
