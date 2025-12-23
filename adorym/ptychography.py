@@ -248,8 +248,13 @@ def reconstruct_ptychography(
     if background_data_type not in valid_background_data_types:
         raise ValueError('background_data_type must be one of {}.'.format(valid_background_data_types))
 
-    use_master_slave = background_data is not None
+    use_dark_bg = background_data is not None
+    use_master_slave = use_dark_bg
+    dark_bg_logged = False
     noise = None
+    if use_dark_bg and not dark_bg_logged:
+        print_flush('Dark background mode enabled', sto_rank, rank, **stdout_options)
+        dark_bg_logged = True
     if use_master_slave:
         print_flush('Master-slave mode enabled with background data: {}'.format(background_data),
                     sto_rank, rank, **stdout_options)
@@ -572,10 +577,11 @@ def reconstruct_ptychography(
         checkpoint_master_slave_state = None
         params_master_slave_state = None
         checkpoint_use_master_slave = False
+        checkpoint_use_dark_bg = False
         needs_initialize = False if use_checkpoint else True
         if use_checkpoint:
             try:
-                optimizable_params, params_master_slave_state, checkpoint_use_master_slave = load_params_checkpoint(
+                optimizable_params, params_master_slave_state, checkpoint_use_master_slave, checkpoint_use_dark_bg = load_params_checkpoint(
                     os.path.join(output_folder, 'checkpoint', 'params_{}'.format(rank)))
             except:
                 optimizable_params = None
@@ -612,13 +618,20 @@ def reconstruct_ptychography(
 
         master_slave_state = merge_master_slave_states(params_master_slave_state, checkpoint_master_slave_state)
         ms_flag = master_slave_state.get('use_master_slave', False) if isinstance(master_slave_state, dict) else False
+        ms_dark_flag = master_slave_state.get('use_dark_bg', False) if isinstance(master_slave_state, dict) else False
         checkpoint_use_master_slave = checkpoint_use_master_slave or ms_flag
+        checkpoint_use_dark_bg = checkpoint_use_dark_bg or ms_dark_flag
         use_master_slave = use_master_slave or checkpoint_use_master_slave
+        use_dark_bg = use_dark_bg or checkpoint_use_dark_bg or use_master_slave
 
         needs_initialize = comm.bcast(needs_initialize, root=0)
         starting_epoch = comm.bcast(starting_epoch, root=0)
         starting_batch = comm.bcast(starting_batch, root=0)
         use_master_slave = comm.bcast(use_master_slave, root=0)
+        use_dark_bg = comm.bcast(use_dark_bg, root=0)
+        if use_dark_bg and not dark_bg_logged:
+            print_flush('Dark background mode enabled', sto_rank, rank, **stdout_options)
+            dark_bg_logged = True
 
         # ================================================================================
         # Create object class.
@@ -1103,7 +1116,7 @@ def reconstruct_ptychography(
                 if store_checkpoint and i_batch % n_batch_per_checkpoint == 0:
                     cp_path = os.path.join(output_folder, 'checkpoint')
                     create_directory_multirank(cp_path)
-                    master_slave_state_to_save = {'use_master_slave': use_master_slave}
+                    master_slave_state_to_save = {'use_master_slave': use_master_slave, 'use_dark_bg': use_dark_bg}
                     if use_master_slave:
                         master_slave_state_to_save['background_map'] = w.to_numpy(
                             optimizable_params.get('background_map')) if optimizable_params.get('background_map') is not None else None
@@ -1111,7 +1124,8 @@ def reconstruct_ptychography(
                             optimizable_params.get('probe_slave_real')) if optimizable_params.get('probe_slave_real') is not None else None
                         master_slave_state_to_save['probe_slave_imag'] = w.to_numpy(
                             optimizable_params.get('probe_slave_imag')) if optimizable_params.get('probe_slave_imag') is not None else None
-                    params_payload = {'params': optimizable_params, 'use_master_slave': use_master_slave}
+                    params_payload = {'params': optimizable_params, 'use_master_slave': use_master_slave,
+                                      'use_dark_bg': use_dark_bg}
                     if master_slave_state_to_save is not None:
                         params_payload['master_slave_state'] = master_slave_state_to_save
                     if distribution_mode == 'shared_file':

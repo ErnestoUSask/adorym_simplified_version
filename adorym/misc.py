@@ -194,7 +194,8 @@ def save_checkpoint(i_epoch, i_batch, output_folder, distribution_mode=None, obj
     else:
         pass
     if master_slave_state is not None:
-        state_to_save = {'use_master_slave': master_slave_state.get('use_master_slave', False)}
+        state_to_save = {'use_master_slave': master_slave_state.get('use_master_slave', False),
+                         'use_dark_bg': master_slave_state.get('use_dark_bg', False)}
         for k in ['background_map', 'probe_slave_real', 'probe_slave_imag']:
             if master_slave_state.get(k) is not None:
                 state_to_save[k] = master_slave_state[k]
