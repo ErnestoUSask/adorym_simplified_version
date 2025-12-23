@@ -188,7 +188,7 @@ def initialize_object_for_do(this_obj_size, slice_catalog=None, ds_level=1, obje
 
 def load_background_data(background_data, normalize=True):
     """
-    Load and normalize background data for master-slave mode.
+    Load background data for master-slave mode and optionally normalize it.
 
     Parameters
     ----------
@@ -200,8 +200,11 @@ def load_background_data(background_data, normalize=True):
     Returns
     -------
     tuple
-        (bg_stack, bg_mean) where ``bg_stack`` is a float32 array of shape
-        (n_bg, y, x) and ``bg_mean`` is the pre-normalization global mean.
+        (bg_stack, bg_mean, bg_scale_factor) where ``bg_stack`` is a float32 array of
+        shape ``(n_bg, y, x)`` on the *model* scale, ``bg_mean`` is the mean of the
+        returned stack (i.e. after optional normalization), and ``bg_scale_factor`` is
+        the multiplicative factor applied to convert raw counts to model scale
+        (``1.0`` if ``normalize`` is False, otherwise the raw global mean).
 
     Raises
     ------
@@ -233,17 +236,19 @@ def load_background_data(background_data, normalize=True):
         raise ValueError('Background stack is empty; expected at least one frame, got shape {}.'.format(bg_stack.shape))
 
     bg_stack = bg_stack.astype('float32', copy=False)
-    bg_mean = float(bg_stack.mean(dtype=np.float64))
-    if not np.isfinite(bg_mean):
-        raise ValueError('Background stack mean is not finite; got {}.'.format(bg_mean))
+    bg_raw_mean = float(bg_stack.mean(dtype=np.float64))
+    if not np.isfinite(bg_raw_mean):
+        raise ValueError('Background stack mean is not finite; got {}.'.format(bg_raw_mean))
 
+    bg_scale_factor = bg_raw_mean if normalize else 1.0
     if normalize:
-        if bg_mean <= 0:
-            raise ValueError('Background stack mean must be positive to normalize; got {}.'.format(bg_mean))
-        bg_stack = bg_stack / bg_mean
+        if bg_scale_factor <= 0:
+            raise ValueError('Background stack mean must be positive to normalize; got {}.'.format(bg_scale_factor))
+        bg_stack = bg_stack / bg_scale_factor
         bg_stack = bg_stack.astype('float32', copy=False)
 
-    return bg_stack, bg_mean
+    bg_mean = float(bg_stack.mean(dtype=np.float64))
+    return bg_stack, bg_mean, bg_scale_factor
 
 
 def generate_gaussian_map(size, mag_max, mag_sigma, phase_max, phase_sigma):

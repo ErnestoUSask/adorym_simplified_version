@@ -244,15 +244,18 @@ def reconstruct_ptychography(
     if use_master_slave:
         print_flush('Master-slave mode enabled with background data: {}'.format(background_data),
                     sto_rank, rank, **stdout_options)
-        bg_stack, bg_mean = load_background_data(background_data)
+        bg_stack, bg_mean_model, bg_scale_factor = load_background_data(background_data)
         print_flush(
-            'Background stack loaded. shape: {}; dtype: {}; min: {:.6g}; max: {:.6g}; mean: {:.6g}'.format(
-                bg_stack.shape, bg_stack.dtype, float(bg_stack.min()), float(bg_stack.max()), float(bg_stack.mean())
+            'Background stack loaded. shape: {}; dtype: {}; min: {:.6g}; max: {:.6g}; mean: {:.6g}; '
+            'scale_factor(raw->model): {:.6g}'.format(
+                bg_stack.shape, bg_stack.dtype, float(bg_stack.min()), float(bg_stack.max()),
+                float(bg_mean_model), float(bg_scale_factor)
             ),
             0, rank, **stdout_options)
     else:
         bg_stack = None
-        bg_mean = None
+        bg_mean_model = None
+        bg_scale_factor = None
 
     # ================================================================================
     # Create pointer for raw data.
@@ -261,6 +264,15 @@ def reconstruct_ptychography(
     print_flush('Reading data...', sto_rank, rank, **stdout_options)
     f = h5py.File(os.path.join(save_path, fname), 'r')
     prj = f['exchange/data']
+    measured_diff_mag_mean = None
+    try:
+        prj_sample = np.array(prj[0], dtype=np.float64)
+        if raw_data_type == 'intensity':
+            measured_diff_mag_mean = float(np.sqrt(np.clip(prj_sample, a_min=0.0, a_max=None)).mean())
+        else:
+            measured_diff_mag_mean = float(prj_sample.mean())
+    except Exception as e:
+        warnings.warn('Unable to compute measured diffraction magnitude mean: {}'.format(e))
 
     # ================================================================================
     # Get metadata.
@@ -376,6 +388,7 @@ def reconstruct_ptychography(
                       'process data from the same rotation angle in each synchronized'
                       'batch.')
     master_slave_init_logged = False
+    background_scale_logged = False
 
     def pad_or_crop_background(bg_arr_np, target_shape):
         if tuple(bg_arr_np.shape) != tuple(target_shape):
@@ -401,7 +414,8 @@ def reconstruct_ptychography(
         bg_arr = w.create_variable(bg_arr_np, device=device, requires_grad=True, dtype=dtype)
         return bg_arr
 
-    def initialize_background_map_from_stack(bg_stack_arr, target_shape, dtype, device, backend_name, raw_data_type):
+    def initialize_background_map_from_stack(bg_stack_arr, target_shape, dtype, device, backend_name, raw_data_type,
+                                             return_mean=False):
         """
         Initialize the background map using per-pixel statistics from the supplied stack.
         """
@@ -414,8 +428,23 @@ def reconstruct_ptychography(
         if raw_data_type == 'intensity':
             bg_arr_np = np.sqrt(np.clip(bg_arr_np, a_min=0.0, a_max=None))
         bg_arr_np = pad_or_crop_background(bg_arr_np.astype('float32', copy=False), target_shape)
+        bg_arr_mean = float(bg_arr_np.mean(dtype=np.float64))
         bg_arr = w.create_variable(bg_arr_np, device=device, requires_grad=True, dtype=dtype)
+        if return_mean:
+            return bg_arr, bg_arr_mean
         return bg_arr
+
+    def compute_background_target_mean(bg_stack_arr, target_shape, raw_data_type):
+        if bg_stack_arr is None:
+            return None
+        if bg_stack_arr.ndim == 3:
+            bg_arr_np = np.mean(bg_stack_arr, axis=0)
+        else:
+            bg_arr_np = np.squeeze(bg_stack_arr)
+        if raw_data_type == 'intensity':
+            bg_arr_np = np.sqrt(np.clip(bg_arr_np, a_min=0.0, a_max=None))
+        bg_arr_np = pad_or_crop_background(bg_arr_np.astype('float32', copy=False), target_shape)
+        return float(bg_arr_np.mean(dtype=np.float64))
 
     for ds_level in range(multiscale_level - 1, -1, -1):
 
@@ -437,6 +466,18 @@ def reconstruct_ptychography(
         if minibatch_size is None:
             minibatch_size = len(probe_pos)
         w.barrier(comm)
+
+        background_target_mean = None
+        if use_master_slave:
+            background_target_mean = compute_background_target_mean(bg_stack, this_obj_size[:2], raw_data_type)
+            if not background_scale_logged:
+                log_msg = 'Background scale -> factor(raw->model): {:.6g}; target_mean(model): {}'.format(
+                    float(bg_scale_factor), background_target_mean)
+                if measured_diff_mag_mean is not None:
+                    log_msg += '; measured_diff_mag_mean: {:.6g}; ratio(N/data): {:.6g}'.format(
+                        measured_diff_mag_mean, background_target_mean / (measured_diff_mag_mean + 1e-12))
+                print_flush(log_msg, sto_rank, rank, **stdout_options)
+                background_scale_logged = True
 
         # ================================================================================
         # Create output directory.
@@ -649,9 +690,9 @@ def reconstruct_ptychography(
             if not any(isinstance(r, ProbeSlaveRatioRegularizer) for r in regularizers) and \
                     probe_slave_ratio_weight not in [0, None]:
                 regularizers.append(ProbeSlaveRatioRegularizer(probe_slave_ratio_weight, probe_slave_max_ratio))
-            if bg_mean is not None and background_mean_pull_weight not in [0, None] and \
+            if background_target_mean is not None and background_mean_pull_weight not in [0, None] and \
                     not any(isinstance(r, BackgroundMeanPullRegularizer) for r in regularizers):
-                regularizers.append(BackgroundMeanPullRegularizer(background_mean_pull_weight, target_mean=bg_mean))
+                regularizers.append(BackgroundMeanPullRegularizer(background_mean_pull_weight, target_mean=background_target_mean))
         forward_model.add_regularizers(regularizers)
         reg_rwl1 = None
         reweighted_l1 = False
