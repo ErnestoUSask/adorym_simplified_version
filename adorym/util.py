@@ -186,7 +186,8 @@ def initialize_object_for_do(this_obj_size, slice_catalog=None, ds_level=1, obje
     return obj_delta.astype(dtype), obj_beta.astype(dtype)
 
 
-def load_background_data(background_data, normalize=True):
+def load_background_data(background_data, normalize=True, axis_order_hint=None,
+                         transpose_to_standard=True, logger=None):
     """
     Load background data for master-slave mode and optionally normalize it.
 
@@ -196,6 +197,17 @@ def load_background_data(background_data, normalize=True):
         Path to a TIFF stack on disk or an in-memory NumPy array.
     normalize : bool, optional
         If True (default), divide the stack by its global mean.
+    axis_order_hint : str or tuple, optional
+        Optional hint for the spatial axis order of the stack. Accepts ``'nyx'``,
+        ``'nxy'``, ``'yx'``, ``'xy'`` or a 2-tuple/list such as ``('y', 'x')``.
+        If provided, this overrides any metadata-derived order.
+    transpose_to_standard : bool, optional
+        If True (default), transpose stacks detected as ``(n, x, y)`` into
+        ``(n, y, x)`` for downstream consistency. If False, the inferred order is
+        logged but the data are left untouched.
+    logger : callable, optional
+        Callable used for logging messages. If None, ``print_flush`` is used with
+        ``designate_rank=0``.
 
     Returns
     -------
@@ -216,12 +228,66 @@ def load_background_data(background_data, normalize=True):
         If the array dimensions are invalid or contain no data.
     """
 
+    def _log(message):
+        if logger is not None:
+            logger(message)
+        else:
+            try:
+                print_flush(message, designate_rank=0, this_rank=rank)
+            except Exception:
+                print(message)
+
+    def _normalize_hint(hint):
+        if hint is None:
+            return None
+        if isinstance(hint, str):
+            hint = hint.lower()
+            if hint in ('nyx', 'yx'):
+                return 'nyx'
+            if hint in ('nxy', 'xy'):
+                return 'nxy'
+        if isinstance(hint, (list, tuple)) and len(hint) == 2:
+            normalized = tuple(str(i).lower() for i in hint)
+            if normalized == ('y', 'x'):
+                return 'nyx'
+            if normalized == ('x', 'y'):
+                return 'nxy'
+        raise ValueError("axis_order_hint must be one of 'nyx', 'nxy', 'yx', 'xy' "
+                         "or a 2-tuple/list such as ('y', 'x').")
+
+    def _infer_order_from_metadata(path):
+        axes_order = None
+        try:
+            import tifffile
+            with tifffile.TiffFile(path) as tif:
+                series = tif.series[0] if tif.series else None
+                axes = getattr(series, 'axes', None)
+                if axes is None and tif.pages:
+                    desc_tag = tif.pages[0].tags.get('ImageDescription')
+                    if desc_tag:
+                        desc_val = desc_tag.value
+                        axes_match = re.search(r'axes\s*[:=]\s*([A-Za-z]+)', desc_val)
+                        if axes_match:
+                            axes = axes_match.group(1)
+                if axes:
+                    axes_lower = axes.lower()
+                    if 'x' in axes_lower and 'y' in axes_lower:
+                        if axes_lower.index('y') < axes_lower.index('x'):
+                            axes_order = 'nyx'
+                        elif axes_lower.index('x') < axes_lower.index('y'):
+                            axes_order = 'nxy'
+        except Exception:
+            axes_order = None
+        return axes_order
+
     if isinstance(background_data, str):
         if not os.path.exists(background_data):
             raise FileNotFoundError("Background TIFF stack not found at '{}'.".format(background_data))
         bg_stack = dxchange.read_tiff(background_data)
+        metadata_order = _infer_order_from_metadata(background_data)
     elif isinstance(background_data, np.ndarray):
         bg_stack = background_data
+        metadata_order = None
     else:
         raise TypeError('Background data must be a TIFF stack path or a NumPy array.')
 
@@ -234,6 +300,27 @@ def load_background_data(background_data, normalize=True):
 
     if np.prod(bg_stack.shape) == 0 or bg_stack.shape[0] < 1:
         raise ValueError('Background stack is empty; expected at least one frame, got shape {}.'.format(bg_stack.shape))
+
+    hint_order = _normalize_hint(axis_order_hint)
+    inferred_order = hint_order or metadata_order or 'nyx'
+    if hint_order and metadata_order and hint_order != metadata_order:
+        _log('Background axis order hint ({}) overrides metadata-derived order ({}).'.format(hint_order, metadata_order))
+    elif hint_order:
+        _log('Background axis order provided by user hint: {}.'.format(hint_order))
+    elif metadata_order:
+        _log('Background axis order inferred from metadata: {}.'.format(metadata_order))
+    else:
+        _log('No background axis metadata or hint found; assuming (n, y, x).')
+
+    if inferred_order == 'nxy':
+        if transpose_to_standard:
+            bg_stack = np.transpose(bg_stack, (0, 2, 1))
+            _log('Background stack transposed from (n, x, y) to (n, y, x).')
+            inferred_order = 'nyx'
+        else:
+            _log('Background stack retained in (n, x, y) order (transpose_to_standard=False).')
+    else:
+        _log('Background stack treated as (n, y, x); no transpose applied.')
 
     bg_stack = bg_stack.astype('float32', copy=False)
     bg_raw_mean = float(bg_stack.mean(dtype=np.float64))
