@@ -50,6 +50,11 @@ class ForwardModel(object):
         self.regularizer_values = {}
         self.raw_data_type = raw_data_type
         self.i_call = 0
+        self.dark_bg_stats_logged = False
+        self.last_intensity = None
+        self.use_dark_bg = False
+        self.dark_bg_B = None
+        self.bg_scale_factor = 1.0
         self.common_vars = common_vars_dict
         if common_vars_dict is not None:
             self.unknown_type = common_vars_dict['unknown_type']
@@ -64,6 +69,10 @@ class ForwardModel(object):
             self.common_probe_pos = common_vars_dict['common_probe_pos']
             self.binning = common_vars_dict['binning']
             self.prj = common_vars_dict['prj'] # HDF5 dataset pointer
+            self.use_dark_bg = common_vars_dict.get('use_dark_bg', False)
+            self.dark_bg_B = common_vars_dict.get('dark_bg_B')
+            bg_scale = common_vars_dict.get('bg_scale_factor', 1.0)
+            self.bg_scale_factor = 1.0 if bg_scale is None else bg_scale
         self.loss_args = {}
         self.reg_list = []
 
@@ -91,14 +100,30 @@ class ForwardModel(object):
                 return i
         raise ValueError('{} is not in the argument list.'.format(arg))
 
-    def get_mismatch_loss(self, this_pred_batch, this_prj_batch):
+    def get_mismatch_loss(self, this_pred_batch, this_prj_batch, predicted_intensity=None, background=None):
         if self.loss_function_type == 'lsq':
             if self.raw_data_type == 'magnitude':
                 loss = w.mean((this_pred_batch - w.abs(this_prj_batch)) ** 2)
             elif self.raw_data_type == 'intensity':
                 loss = w.mean((this_pred_batch - w.sqrt(w.abs(this_prj_batch))) ** 2)
         elif self.loss_function_type == 'poisson':
-            if self.raw_data_type == 'magnitude':
+            eps = 1e-10
+            if self.use_dark_bg and background is not None:
+                I = predicted_intensity if predicted_intensity is not None else this_pred_batch ** 2
+                data_intensity = w.abs(this_prj_batch) ** 2 if self.raw_data_type == 'magnitude' else w.abs(this_prj_batch)
+                Ihat = self.bg_scale_factor * I + background
+                Ihat = w.clip(Ihat * self.poisson_multiplier, eps, None)
+                data_intensity = data_intensity * self.poisson_multiplier
+                if not self.dark_bg_stats_logged:
+                    print_flush(
+                        '  Dark-background Poisson stats -> mean(I): {:.6g}, mean(B): {:.6g}, min(Ihat): {:.6g}'.format(
+                            float(w.to_numpy(w.mean(I))),
+                            float(w.to_numpy(w.mean(background))),
+                            float(w.to_numpy(w.min(Ihat)))),
+                        0, rank, **self.stdout_options)
+                    self.dark_bg_stats_logged = True
+                loss = w.sum(Ihat - data_intensity * w.log(Ihat + eps))
+            elif self.raw_data_type == 'magnitude':
                 loss = w.mean(this_pred_batch ** 2 * self.poisson_multiplier -
                               w.abs(this_prj_batch) ** 2 * self.poisson_multiplier * w.log(
                     this_pred_batch ** 2 * self.poisson_multiplier))
@@ -122,7 +147,7 @@ class ForwardModel(object):
         this_prj_batch = w.create_variable(abs(this_prj_batch), requires_grad=False, device=self.device)
         if ds_level > 1:
             this_prj_batch = this_prj_batch[:, ::ds_level, ::ds_level]
-        if self.common_vars.get('use_dark_bg', False):
+        if self.common_vars.get('use_dark_bg', False) and self.loss_function_type != 'poisson':
             dark_bg = self.common_vars.get('dark_bg_B')
             if dark_bg is not None:
                 dark_bg_local = dark_bg[::ds_level, ::ds_level] if ds_level > 1 else dark_bg
@@ -144,15 +169,33 @@ class ForwardModel(object):
         If this is not the case for your specific ForwardModel class, override this method.
         """
         beamstop = self.common_vars['beamstop']
+        pred_intensity = getattr(self, 'last_intensity', None)
+        pred_batch = this_pred_batch
+        if isinstance(this_pred_batch, tuple):
+            pred_batch = this_pred_batch[0]
+            if len(this_pred_batch) > 1:
+                pred_intensity = this_pred_batch[1]
+        if pred_intensity is None:
+            pred_intensity = pred_batch ** 2
+        background_batch = None
+        if getattr(self, 'use_dark_bg', False) and self.dark_bg_B is not None:
+            ds_level = self.common_vars.get('ds_level', 1)
+            background_map = self.dark_bg_B[::ds_level, ::ds_level] if ds_level > 1 else self.dark_bg_B
+            background_batch = w.create_variable(background_map, requires_grad=False, device=self.device)
+            if len(pred_batch.shape) > 2:
+                background_batch = w.tile(background_batch, [len(pred_batch), 1, 1])
         if beamstop is not None:
             beamstop[beamstop >= 1e-5] = 1
             beamstop[beamstop < 1e-5] = 0
             beamstop = w.cast(beamstop, 'bool')
-            beamstop_mask_stack = w.tile(beamstop, [len(this_pred_batch), 1, 1])
-            this_pred_batch = w.reshape(this_pred_batch[beamstop_mask_stack], [beamstop_mask_stack.shape[0], -1])
+            beamstop_mask_stack = w.tile(beamstop, [len(pred_batch), 1, 1])
+            pred_batch = w.reshape(pred_batch[beamstop_mask_stack], [beamstop_mask_stack.shape[0], -1])
+            pred_intensity = w.reshape(pred_intensity[beamstop_mask_stack], [beamstop_mask_stack.shape[0], -1])
             this_prj_batch = w.reshape(this_prj_batch[beamstop_mask_stack], [beamstop_mask_stack.shape[0], -1])
-            print_flush('  {} valid pixels remain after applying beamstop mask.'.format(this_pred_batch.shape[1]), 0, rank)
-        loss = self.get_mismatch_loss(this_pred_batch, this_prj_batch)
+            if background_batch is not None:
+                background_batch = w.reshape(background_batch[beamstop_mask_stack], [beamstop_mask_stack.shape[0], -1])
+            print_flush('  {} valid pixels remain after applying beamstop mask.'.format(pred_batch.shape[1]), 0, rank)
+        loss = self.get_mismatch_loss(pred_batch, this_prj_batch, predicted_intensity=pred_intensity, background=background_batch)
         if len(self.reg_list) > 0:
             loss = loss + self.get_regularization_value(obj, device=self.device, **self.loss_args)
         loss_val = w.to_numpy(loss)
@@ -318,6 +361,7 @@ class PtychographyModel(ForwardModel):
             obj_rot = obj
 
         ex_mag_ls = []
+        ex_int_ls = []
 
         # Pad if needed
         pad_arr = np.array([[0, 0], [0, 0]])
@@ -476,7 +520,9 @@ class PtychographyModel(ForwardModel):
                 ex_real, ex_imag = propagate_master_slave(
                     this_probe_real_ls, this_probe_imag_ls,
                     slave_real=this_probe_slave_real_ls, slave_imag=this_probe_slave_imag_ls)
-                ex_mag_ls.append(w.norm(ex_real, ex_imag))
+                ex_int = ex_real ** 2 + ex_imag ** 2
+                ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
             else:
                 for i_mode in range(n_probe_modes):
                     if len(probe_real_ls.shape) == 3:
@@ -497,13 +543,17 @@ class PtychographyModel(ForwardModel):
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
                 ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
         del subobj_ls, subnoise_ls, probe_real_ls, probe_imag_ls
 
         # Output shape is [minibatch_size, y, x].
         if len(ex_mag_ls) > 1:
             ex_mag_ls = w.concatenate(ex_mag_ls, 0)
+            ex_int_ls = w.concatenate(ex_int_ls, 0)
         else:
             ex_mag_ls = ex_mag_ls[0]
+            ex_int_ls = ex_int_ls[0]
+        self.last_intensity = ex_int_ls
         if rank == 0 and debug and self.i_call % 10 == 0:
             ex_mag_val = w.to_numpy(ex_mag_ls)
             dxchange.write_tiff(ex_mag_val, os.path.join(output_folder, 'intermediate', 'detected_mag'), dtype='float32', overwrite=True)
@@ -614,7 +664,9 @@ class SingleBatchFullfieldModel(PtychographyModel):
             type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
             scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
             pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
-        ex_mag_ls = w.norm(ex_real, ex_imag)
+        ex_int = ex_real ** 2 + ex_imag ** 2
+        ex_mag_ls = w.sqrt(ex_int)
+        self.last_intensity = ex_int
 
         if self.simulation_mode:
             return ex_real, ex_imag
@@ -892,7 +944,9 @@ class SparseMultisliceModel(ForwardModel):
                                 fresnel_approx=fresnel_approx, device=device_obj,
                                 type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
                                 scale_ri_by_k=self.scale_ri_by_k, shift_exit_wave=this_prj_offset)
-                ex_mag_ls.append(w.norm(ex_real, ex_imag))
+                ex_int = ex_real ** 2 + ex_imag ** 2
+                ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
             else:
                 for i_mode in range(n_probe_modes):
                     if len(probe_real_ls.shape) == 3:
@@ -914,13 +968,17 @@ class SparseMultisliceModel(ForwardModel):
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
                 ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
         del subobj_ls, probe_real_ls, probe_imag_ls
 
         # Output shape is [minibatch_size, y, x].
         if len(ex_mag_ls) > 1:
             ex_mag_ls = w.concatenate(ex_mag_ls, 0)
+            ex_int_ls = w.concatenate(ex_int_ls, 0)
         else:
             ex_mag_ls = ex_mag_ls[0]
+            ex_int_ls = ex_int_ls[0]
+        self.last_intensity = ex_int_ls
         if rank == 0 and debug and self.i_call % 10 == 0:
             ex_mag_val = w.to_numpy(ex_mag_ls)
             dxchange.write_tiff(ex_mag_val, os.path.join(output_folder, 'intermediate', 'detected_mag'),
@@ -1154,15 +1212,20 @@ class MultiDistModel(ForwardModel):
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
                 ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
 
         # Output shape is [minibatch_size, y, x].
         if len(ex_mag_ls) > 1:
             ex_mag_ls = w.concatenate(ex_mag_ls, 0)
+            ex_int_ls = w.concatenate(ex_int_ls, 0)
         else:
             ex_mag_ls = ex_mag_ls[0]
+            ex_int_ls = ex_int_ls[0]
 
         if safe_zone_width > 0:
             ex_mag_ls = ex_mag_ls[:, safe_zone_width:safe_zone_width + subprobe_size[0],
+                                     safe_zone_width:safe_zone_width + subprobe_size[1]]
+            ex_int_ls = ex_int_ls[:, safe_zone_width:safe_zone_width + subprobe_size[0],
                                      safe_zone_width:safe_zone_width + subprobe_size[1]]
 
         if rank == 0 and debug:
@@ -1170,6 +1233,7 @@ class MultiDistModel(ForwardModel):
             dxchange.write_tiff(ex_mag_val, os.path.join(output_folder, 'intermediate', 'detected_mag'), dtype='float32', overwrite=True)
 
         del subobj_ls_ls, subprobe_real_ls_ls, subprobe_imag_ls_ls
+        self.last_intensity = ex_int_ls
         self.i_call += 1
         return ex_mag_ls
 
