@@ -251,6 +251,8 @@ def reconstruct_ptychography(
     use_dark_bg = background_data is not None
     use_master_slave = use_dark_bg
     dark_bg_logged = False
+    dark_bg_B = None
+    dark_bg_variance = None
     noise = None
     if use_dark_bg and not dark_bg_logged:
         print_flush('Dark background mode enabled', sto_rank, rank, **stdout_options)
@@ -267,6 +269,32 @@ def reconstruct_ptychography(
                 float(bg_mean_model), float(bg_scale_factor)
             ),
             0, rank, **stdout_options)
+        try:
+            if rank == 0:
+                dark_stack_loaded = load_background_data(
+                    background_data, normalize=False, transpose_to_standard=True,
+                    background_data_type=background_data_type, mode='dark_bg', return_variance=debug)
+                if isinstance(dark_stack_loaded, tuple) and len(dark_stack_loaded) == 4:
+                    dark_stack, _, _, dark_bg_variance = dark_stack_loaded
+                else:
+                    dark_stack, _, _ = dark_stack_loaded
+                dark_bg_B = np.median(dark_stack, axis=0).astype(
+                    'float64' if global_settings.run_fp64 else 'float32', copy=False)
+                if dark_bg_variance is not None:
+                    dark_bg_variance = np.asarray(dark_bg_variance).astype(
+                        'float64' if global_settings.run_fp64 else 'float32', copy=False)
+                dark_bg_B = np.clip(dark_bg_B, a_min=0.0, a_max=None)
+            dark_bg_B = comm.bcast(dark_bg_B, root=0)
+            dark_bg_variance = comm.bcast(dark_bg_variance, root=0)
+            if rank == 0 and dark_bg_B is not None:
+                print_flush(
+                    'Dark background B computed. shape: {}; dtype: {}; min: {:.6g}; max: {:.6g}; mean: {:.6g}.'.format(
+                        dark_bg_B.shape, dark_bg_B.dtype, float(dark_bg_B.min()),
+                        float(dark_bg_B.max()), float(dark_bg_B.mean())
+                    ),
+                    sto_rank, rank, **stdout_options)
+        except Exception as e:
+            warnings.warn('Failed to load or compute dark background median: {}'.format(e))
     else:
         bg_stack = None
         bg_mean_model = None
@@ -617,6 +645,11 @@ def reconstruct_ptychography(
             return merged
 
         master_slave_state = merge_master_slave_states(params_master_slave_state, checkpoint_master_slave_state)
+        if isinstance(master_slave_state, dict):
+            if master_slave_state.get('dark_bg_B') is not None:
+                dark_bg_B = master_slave_state.get('dark_bg_B')
+            if master_slave_state.get('dark_bg_variance') is not None:
+                dark_bg_variance = master_slave_state.get('dark_bg_variance')
         ms_flag = master_slave_state.get('use_master_slave', False) if isinstance(master_slave_state, dict) else False
         ms_dark_flag = master_slave_state.get('use_dark_bg', False) if isinstance(master_slave_state, dict) else False
         checkpoint_use_master_slave = checkpoint_use_master_slave or ms_flag
@@ -629,6 +662,9 @@ def reconstruct_ptychography(
         starting_batch = comm.bcast(starting_batch, root=0)
         use_master_slave = comm.bcast(use_master_slave, root=0)
         use_dark_bg = comm.bcast(use_dark_bg, root=0)
+        if use_dark_bg:
+            dark_bg_B = comm.bcast(dark_bg_B, root=0)
+            dark_bg_variance = comm.bcast(dark_bg_variance, root=0)
         if use_dark_bg and not dark_bg_logged:
             print_flush('Dark background mode enabled', sto_rank, rank, **stdout_options)
             dark_bg_logged = True
@@ -1117,6 +1153,10 @@ def reconstruct_ptychography(
                     cp_path = os.path.join(output_folder, 'checkpoint')
                     create_directory_multirank(cp_path)
                     master_slave_state_to_save = {'use_master_slave': use_master_slave, 'use_dark_bg': use_dark_bg}
+                    if dark_bg_B is not None:
+                        master_slave_state_to_save['dark_bg_B'] = dark_bg_B
+                    if dark_bg_variance is not None:
+                        master_slave_state_to_save['dark_bg_variance'] = dark_bg_variance
                     if use_master_slave:
                         master_slave_state_to_save['background_map'] = w.to_numpy(
                             optimizable_params.get('background_map')) if optimizable_params.get('background_map') is not None else None

@@ -188,7 +188,8 @@ def initialize_object_for_do(this_obj_size, slice_catalog=None, ds_level=1, obje
 
 def load_background_data(background_data, normalize=True, axis_order_hint=None,
                          transpose_to_standard=True, logger=None,
-                         background_data_type='detector_intensity'):
+                         background_data_type='detector_intensity',
+                         mode='background', return_variance=False):
     """
     Load background data for master-slave mode and optionally normalize it.
 
@@ -215,15 +216,25 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
         magnitudes via square-root before optional normalization. ``'object_transmission'``
         assumes the data already represent non-negative sample-plane transmission
         magnitudes and validates accordingly.
+    mode : {'background', 'dark_bg'}, optional
+        Select processing mode. ``'background'`` (default) keeps the legacy behaviour for
+        initializing a learnable background map, including magnitude conversion and optional
+        normalization. ``'dark_bg'`` loads the stack without unit conversion or normalization
+        and returns it in the original measurement units for dark-current subtraction.
+    return_variance : bool, optional
+        If True and ``mode='dark_bg'``, also return the per-pixel variance of the stack for
+        diagnostics. Ignored for ``mode='background'``.
 
     Returns
     -------
     tuple
-        (bg_stack, bg_mean, bg_scale_factor) where ``bg_stack`` is a float32 array of
+        (bg_stack, bg_mean, bg_scale_factor) where ``bg_stack`` is a float32/float64 array of
         shape ``(n_bg, y, x)`` on the *model* scale, ``bg_mean`` is the mean of the
         returned stack (i.e. after optional normalization), and ``bg_scale_factor`` is
         the multiplicative factor applied to convert raw counts to model scale
         (``1.0`` if ``normalize`` is False, otherwise the raw global mean).
+        When ``mode='dark_bg'``, ``bg_mean`` will be ``None`` and ``bg_scale_factor`` is 1.0.
+        If ``return_variance`` is True in dark mode, a 4th element (variance map) is returned.
 
     Raises
     ------
@@ -243,6 +254,10 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
                 print_flush(message, designate_rank=0, this_rank=rank)
             except Exception:
                 print(message)
+
+    mode = mode.lower()
+    if mode not in ('background', 'dark_bg'):
+        raise ValueError('mode must be "background" or "dark_bg".')
 
     def _normalize_hint(hint):
         if hint is None:
@@ -338,10 +353,22 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
     else:
         _log('Background stack treated as (n, y, x); no transpose applied.')
 
-    bg_stack = _normalize_background_units(bg_stack)
-    _log('Background data interpreted as {} and converted to model magnitudes.'.format(background_data_type))
+    dtype = 'float64' if getattr(global_settings, 'run_fp64', False) else 'float32'
 
-    bg_stack = bg_stack.astype('float32', copy=False)
+    if mode == 'background':
+        bg_stack = _normalize_background_units(bg_stack)
+        _log('Background data interpreted as {} and converted to model magnitudes.'.format(background_data_type))
+
+    bg_stack = bg_stack.astype(dtype, copy=False)
+
+    if mode == 'dark_bg':
+        variance_map = None
+        if return_variance:
+            variance_map = np.var(bg_stack, axis=0, dtype=np.float64).astype(dtype, copy=False)
+        if return_variance:
+            return bg_stack, None, 1.0, variance_map
+        return bg_stack, None, 1.0
+
     bg_raw_mean = float(bg_stack.mean(dtype=np.float64))
     if not np.isfinite(bg_raw_mean):
         raise ValueError('Background stack mean is not finite; got {}.'.format(bg_raw_mean))
@@ -351,7 +378,7 @@ def load_background_data(background_data, normalize=True, axis_order_hint=None,
         if bg_scale_factor <= 0:
             raise ValueError('Background stack mean must be positive to normalize; got {}.'.format(bg_scale_factor))
         bg_stack = bg_stack / bg_scale_factor
-        bg_stack = bg_stack.astype('float32', copy=False)
+        bg_stack = bg_stack.astype(dtype, copy=False)
 
     bg_mean = float(bg_stack.mean(dtype=np.float64))
     return bg_stack, bg_mean, bg_scale_factor

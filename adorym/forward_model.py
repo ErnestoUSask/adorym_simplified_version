@@ -122,6 +122,18 @@ class ForwardModel(object):
         this_prj_batch = w.create_variable(abs(this_prj_batch), requires_grad=False, device=self.device)
         if ds_level > 1:
             this_prj_batch = this_prj_batch[:, ::ds_level, ::ds_level]
+        if self.common_vars.get('use_dark_bg', False):
+            dark_bg = self.common_vars.get('dark_bg_B')
+            if dark_bg is not None:
+                dark_bg_local = dark_bg[::ds_level, ::ds_level] if ds_level > 1 else dark_bg
+                dark_bg_local = w.create_variable(dark_bg_local, requires_grad=False, device=self.device)
+                if self.raw_data_type == 'intensity':
+                    this_prj_batch = this_prj_batch - dark_bg_local
+                    this_prj_batch = w.clip(this_prj_batch, 0.0, None)
+                else:
+                    dark_bg_mag = w.sqrt(w.clip(dark_bg_local, 0.0, None))
+                    this_prj_batch = this_prj_batch - dark_bg_mag
+                    this_prj_batch = w.clip(this_prj_batch, 0.0, None)
         return this_prj_batch
 
     def loss(self, this_pred_batch, this_prj_batch, obj):
