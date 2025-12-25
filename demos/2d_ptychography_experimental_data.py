@@ -18,6 +18,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--epoch', default='None')
 parser.add_argument('--save_path', default='cone_256_foam_ptycho')
 parser.add_argument('--output_folder', default='test') # Will create epoch folders under this
+parser.add_argument('--background_data', default=None, help='Path to dark-frame TIFF stack (counts).')
 args = parser.parse_args()
 epoch = args.epoch
 if epoch == 'None':
@@ -41,6 +42,11 @@ optimizer_probe = adorym.AdamOptimizer('probe', output_folder=output_folder, dis
                                         options_dict={'step_size': 1e-3, 'eps': 1e-7})
 optimizer_all_probe_pos = adorym.AdamOptimizer('probe_pos_correction', output_folder=output_folder, distribution_mode=distribution_mode,
                                                options_dict={'step_size': 1e-2})
+
+background_stack_path = args.background_data
+if background_stack_path is None:
+    candidate_dark = os.path.join(args.save_path, 'dark_frames.tiff')
+    background_stack_path = candidate_dark if os.path.exists(candidate_dark) else None
 
 params_2idd_gpu = {'fname': 'data.h5',
                     'theta_st': 0,
@@ -73,6 +79,8 @@ params_2idd_gpu = {'fname': 'data.h5',
                     'backend': 'pytorch',
                     'raw_data_type': 'intensity',
                     'beamstop': None,
+                    'background_data': background_stack_path,
+                    'use_coherent_master_slave': False,
                     'optimizer': optimizer_obj,
                     'optimize_probe': True,
                     'optimizer_probe': optimizer_probe,
@@ -82,7 +90,7 @@ params_2idd_gpu = {'fname': 'data.h5',
                     'update_scheme': 'immediate',
                     'unknown_type': 'real_imag',
                     'save_stdout': True,
-                    'loss_function_type': 'lsq',
+                    'loss_function_type': 'poisson',
                     'normalize_fft': False
                     }
 
