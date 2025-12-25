@@ -453,6 +453,7 @@ def initialize_probe(probe_size, probe_type, pupil_function=None, probe_initial=
     #     probe_real, probe_imag = np.real(wavefront), np.imag(wavefront)
     if rescale_intensity:
         n_probe_modes = kwargs['n_probe_modes']
+        ds_level = kwargs.get('ds_level', 1)
         f = h5py.File(os.path.join(save_path, fname), 'r')
         if f['exchange/data'].shape[0] == 1:
             dat = f['exchange/data'][...]
@@ -460,6 +461,22 @@ def initialize_probe(probe_size, probe_type, pupil_function=None, probe_initial=
             dat = f['exchange/data'][0:1, :, :, :]
         if kwargs['raw_data_type'] == 'magnitude':
             dat = dat ** 2
+        dark_bg_map = kwargs.get('dark_bg_B')
+        if dark_bg_map is not None:
+            dark_bg_arr = np.asarray(dark_bg_map)
+            if dark_bg_arr.ndim == 3:
+                dark_bg_arr = np.mean(dark_bg_arr, axis=0)
+            if ds_level > 1:
+                dark_bg_arr = dark_bg_arr[::ds_level, ::ds_level]
+            dark_bg_arr = np.clip(dark_bg_arr, a_min=0.0, a_max=None)
+            while dark_bg_arr.ndim < dat.ndim:
+                dark_bg_arr = dark_bg_arr[None, ...]
+            if dark_bg_arr.shape[-2:] != dat.shape[-2:]:
+                warnings.warn(
+                    'Dark background map shape {} does not match data shape {} during probe scaling.'.format(
+                        dark_bg_arr.shape, dat.shape))
+            else:
+                dat = np.clip(dat - dark_bg_arr, a_min=0.0, a_max=None)
         if not kwargs['normalize_fft']:
             # The direct return of FFT function has a total power that is n_pixels times of the input.
             # This should be removed.
@@ -472,7 +489,7 @@ def initialize_probe(probe_size, probe_type, pupil_function=None, probe_initial=
         intensity_current = np.sum(probe_real ** 2 + probe_imag ** 2)
         if len(probe_real) == 3:
             intensity_current /= probe_real.shape[0]
-        s = np.sqrt(intensity_target / intensity_current)
+        s = np.sqrt(intensity_target / (intensity_current + 1e-12))
         # s = np.sqrt(intensity_target / intensity_current / n_probe_modes)
         probe_real = probe_real * s
         probe_imag = probe_imag * s

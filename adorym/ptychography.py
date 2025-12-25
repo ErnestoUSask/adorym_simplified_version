@@ -57,6 +57,8 @@ def reconstruct_ptychography(
         fname, obj_size, probe_pos=None, theta_st=0, theta_end=PI, n_theta=None, theta_downsample=None,
         energy_ev=None, psize_cm=None, free_prop_cm=None, background_data=None,
         background_data_type='detector_intensity',
+        dark_bg_reducer='median',
+        use_coherent_master_slave=False,
         background_tv_weight=1e-7, probe_slave_ratio_weight=1e-3, probe_slave_max_ratio=0.2,
         background_mean_pull_weight=None, regularizer_log_interval=1,
         raw_data_type='magnitude', # Choose from 'magnitude' or 'intensity'
@@ -164,6 +166,7 @@ def reconstruct_ptychography(
         dynamic_rate=True, pupil_function=None, probe_circ_mask=0.9, dynamic_dropping=False, dropping_threshold=8e-5,
         backend='autograd', # Choose from 'autograd' or 'pytorch
         debug=False,
+        debug_dark_bg=False,
         t_max_min=None,
         # Enable XPU device
         xpu =  False,
@@ -192,17 +195,11 @@ def reconstruct_ptychography(
            angle in each synchronized batch. Doing this will cause all ranks to process the same data.
            To perform large fullfield reconstruction efficiently, divide the data into sub-chunks.
         5. Supplying ``background_data`` (a TIFF stack path or NumPy array shaped ``(n_bg, y, x)`` or
-           a single ``(y, x)`` frame) enables master–slave mode. By default, the data are assumed to be
-           detector-plane **intensities** and are square-rooted before normalization so the learned
-           background map ``N`` starts in transmission-magnitude units. Set ``background_data_type`` to
-           ``'object_transmission'`` if you provide already-propagated transmission magnitudes; negative
-           values will raise an error to prevent accidental misuse. The loader normalizes the stack by its
-           global mean, logs basic statistics, and uses a per-pixel statistic across the stack (mean by
-           default) to initialize a learnable background map that is padded/cropped to the object grid.
-           In standard (non-distributed) runs the background map is sliced per probe patch and propagated
-           as a slave object with its own probe before being coherently summed with the master exit wave.
-           In distributed mode the background map must carry a leading batch dimension to match the
-           distributed tiles.
+           a single ``(y, x)`` frame) enables dark-background handling. Dark frames are treated as
+           detector-plane **intensities** (counts) and are used to build an additive background map ``B``
+           that enters the Poisson likelihood as ``alpha * I + B``. The legacy coherent master–slave
+           pathway is now controlled explicitly by ``use_coherent_master_slave`` (default ``False``) and is
+           not activated by providing dark frames.
     """
 
     t_zero = time.time()
@@ -248,12 +245,43 @@ def reconstruct_ptychography(
     if background_data_type not in valid_background_data_types:
         raise ValueError('background_data_type must be one of {}.'.format(valid_background_data_types))
 
+    valid_raw_data_types = ('intensity', 'magnitude')
+    if raw_data_type not in valid_raw_data_types:
+        raise ValueError('raw_data_type must be one of {}.'.format(valid_raw_data_types))
+
+    dark_bg_reducer = dark_bg_reducer.lower() if isinstance(dark_bg_reducer, str) else dark_bg_reducer
+    if dark_bg_reducer not in ('median', 'mean'):
+        raise ValueError('dark_bg_reducer must be either "median" or "mean".')
+
     use_dark_bg = background_data is not None
-    use_master_slave = use_dark_bg
+    auto_bg_scale_factor = use_dark_bg
+    use_master_slave = bool(use_coherent_master_slave)
+    if use_dark_bg and loss_function_type != 'poisson':
+        warnings.warn('Dark background provided; switching loss_function_type to poisson for consistency.')
+        loss_function_type = 'poisson'
+    print_flush(
+        'Raw data type: {}; loss function: {}; dark background: {}; coherent master-slave: {}'.format(
+            raw_data_type, loss_function_type, use_dark_bg, use_master_slave
+        ),
+        sto_rank, rank, **stdout_options)
+    if use_dark_bg:
+        if isinstance(background_data, str):
+            bg_desc = 'path={}'.format(background_data)
+        elif isinstance(background_data, np.ndarray):
+            bg_desc = 'ndarray shape={} dtype={}'.format(background_data.shape, background_data.dtype)
+        else:
+            bg_desc = 'type={}'.format(type(background_data))
+        print_flush('Dark background input detected: {}'.format(bg_desc), sto_rank, rank, **stdout_options)
+    if use_dark_bg and use_master_slave:
+        warnings.warn('Dark background mode is active while coherent master-slave is also enabled; '
+                      'ensure this is intentional.')
     dark_bg_logged = False
     dark_bg_B = None
     dark_bg_variance = None
     noise = None
+    bg_stack = None
+    bg_mean_model = None
+    bg_scale_factor = None
     if use_dark_bg and not dark_bg_logged:
         print_flush('Dark background mode enabled', sto_rank, rank, **stdout_options)
         dark_bg_logged = True
@@ -269,36 +297,50 @@ def reconstruct_ptychography(
                 float(bg_mean_model), float(bg_scale_factor)
             ),
             0, rank, **stdout_options)
-        try:
+    try:
+        if use_dark_bg:
             if rank == 0:
                 dark_stack_loaded = load_background_data(
                     background_data, normalize=False, transpose_to_standard=True,
-                    background_data_type=background_data_type, mode='dark_bg', return_variance=debug)
+                    background_data_type=background_data_type, mode='dark_bg', return_variance=True)
                 if isinstance(dark_stack_loaded, tuple) and len(dark_stack_loaded) == 4:
                     dark_stack, _, _, dark_bg_variance = dark_stack_loaded
                 else:
                     dark_stack, _, _ = dark_stack_loaded
-                dark_bg_B = np.median(dark_stack, axis=0).astype(
+                reducer_fn = np.median if dark_bg_reducer == 'median' else np.mean
+                dark_bg_B = reducer_fn(dark_stack, axis=0).astype(
                     'float64' if global_settings.run_fp64 else 'float32', copy=False)
                 if dark_bg_variance is not None:
                     dark_bg_variance = np.asarray(dark_bg_variance).astype(
                         'float64' if global_settings.run_fp64 else 'float32', copy=False)
                 dark_bg_B = np.clip(dark_bg_B, a_min=0.0, a_max=None)
+                stats = {
+                    'min': float(np.min(dark_bg_B)),
+                    'max': float(np.max(dark_bg_B)),
+                    'mean': float(np.mean(dark_bg_B)),
+                    'p1': float(np.percentile(dark_bg_B, 1)),
+                    'p50': float(np.percentile(dark_bg_B, 50)),
+                    'p99': float(np.percentile(dark_bg_B, 99)),
+                    'n_frames': int(dark_stack.shape[0]),
+                    'shape': dark_bg_B.shape,
+                    'dtype': str(dark_bg_B.dtype)
+                }
+                print_flush(
+                    'Dark background B computed using {}. frames: {n_frames}; shape: {shape}; dtype: {dtype}; '.format(
+                        dark_bg_reducer, **stats) +
+                    'min: {min:.6g}; mean: {mean:.6g}; max: {max:.6g}; p1/p50/p99: {p1:.6g}/{p50:.6g}/{p99:.6g}'.format(
+                        **stats),
+                    sto_rank, rank, **stdout_options)
+                if dark_bg_variance is not None:
+                    print_flush(
+                        'Dark background variance stats -> min: {:.6g}; mean: {:.6g}; max: {:.6g}'.format(
+                            float(np.min(dark_bg_variance)), float(np.mean(dark_bg_variance)),
+                            float(np.max(dark_bg_variance))),
+                        sto_rank, rank, **stdout_options)
             dark_bg_B = comm.bcast(dark_bg_B, root=0)
             dark_bg_variance = comm.bcast(dark_bg_variance, root=0)
-            if rank == 0 and dark_bg_B is not None:
-                print_flush(
-                    'Dark background B computed. shape: {}; dtype: {}; min: {:.6g}; max: {:.6g}; mean: {:.6g}.'.format(
-                        dark_bg_B.shape, dark_bg_B.dtype, float(dark_bg_B.min()),
-                        float(dark_bg_B.max()), float(dark_bg_B.mean())
-                    ),
-                    sto_rank, rank, **stdout_options)
-        except Exception as e:
-            warnings.warn('Failed to load or compute dark background median: {}'.format(e))
-    else:
-        bg_stack = None
-        bg_mean_model = None
-        bg_scale_factor = None
+    except Exception as e:
+        warnings.warn('Failed to load or compute dark background map: {}'.format(e))
 
     # ================================================================================
     # Create pointer for raw data.
@@ -655,7 +697,8 @@ def reconstruct_ptychography(
         checkpoint_use_master_slave = checkpoint_use_master_slave or ms_flag
         checkpoint_use_dark_bg = checkpoint_use_dark_bg or ms_dark_flag
         use_master_slave = use_master_slave or checkpoint_use_master_slave
-        use_dark_bg = use_dark_bg or checkpoint_use_dark_bg or use_master_slave
+        use_dark_bg = use_dark_bg or checkpoint_use_dark_bg
+        auto_bg_scale_factor = use_dark_bg
 
         needs_initialize = comm.bcast(needs_initialize, root=0)
         starting_epoch = comm.bcast(starting_epoch, root=0)
@@ -804,6 +847,8 @@ def reconstruct_ptychography(
             probe_init_kwargs['psize_cm'] = psize_cm
             probe_init_kwargs['normalize_fft'] = normalize_fft
             probe_init_kwargs['n_probe_modes'] = n_probe_modes
+            probe_init_kwargs['dark_bg_B'] = dark_bg_B
+            probe_init_kwargs['ds_level'] = ds_level
             probe_real_init, probe_imag_init = initialize_probe(probe_size, probe_type, pupil_function=pupil_function, probe_initial=probe_initial,
                                                       rescale_intensity=rescale_probe_intensity, save_path=save_path, fname=fname,
                                                       extra_defocus_cm=probe_extra_defocus_cm,

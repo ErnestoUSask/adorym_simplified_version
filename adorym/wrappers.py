@@ -183,6 +183,8 @@ def create_constant(arr, dtype='float32', device=None, backend='autograd'):
 def to_numpy(var, backend='autograd'):
     if isinstance(var, np.ndarray):
         return var
+    elif isinstance(var, (float, int)):
+        return np.array(var)
     elif isinstance(var, np.float64):
         return var
     else:
