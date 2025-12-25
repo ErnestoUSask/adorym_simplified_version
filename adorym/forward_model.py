@@ -19,6 +19,10 @@ import inspect
 
 import gc
 import time
+import warnings
+import os
+
+import dxchange
 
 import adorym.wrappers as w
 from adorym.regularizers import *
@@ -55,7 +59,12 @@ class ForwardModel(object):
         self.use_dark_bg = False
         self.dark_bg_B = None
         self.bg_scale_factor = 1.0
+        self.auto_bg_scale_factor = False
+        self.bg_scale_factor_auto_done = False
         self.common_vars = common_vars_dict
+        self.comm = common_vars_dict.get('comm') if common_vars_dict is not None else None
+        self.debug_dark_bg = False
+        self.debug_dark_bg_done = False
         if common_vars_dict is not None:
             self.unknown_type = common_vars_dict['unknown_type']
             self.normalize_fft = common_vars_dict['normalize_fft']
@@ -73,6 +82,9 @@ class ForwardModel(object):
             self.dark_bg_B = common_vars_dict.get('dark_bg_B')
             bg_scale = common_vars_dict.get('bg_scale_factor', 1.0)
             self.bg_scale_factor = 1.0 if bg_scale is None else bg_scale
+            self.auto_bg_scale_factor = common_vars_dict.get('auto_bg_scale_factor', False)
+            self.bg_scale_factor_auto_done = False
+            self.debug_dark_bg = common_vars_dict.get('debug_dark_bg', False)
         self.loss_args = {}
         self.reg_list = []
 
@@ -111,6 +123,30 @@ class ForwardModel(object):
             if self.use_dark_bg and background is not None:
                 I = predicted_intensity if predicted_intensity is not None else this_pred_batch ** 2
                 data_intensity = w.abs(this_prj_batch) ** 2 if self.raw_data_type == 'magnitude' else w.abs(this_prj_batch)
+                if self.auto_bg_scale_factor and not self.bg_scale_factor_auto_done:
+                    residual = w.clip(data_intensity - background, 0.0, None)
+                    residual_np = w.to_numpy(residual)
+                    intensity_np = w.to_numpy(I)
+                    residual_sum = float(np.sum(residual_np))
+                    intensity_sum = float(np.sum(intensity_np))
+                    count = residual_np.size
+                    if self.comm is not None:
+                        residual_sum = self.comm.allreduce(residual_sum)
+                        intensity_sum = self.comm.allreduce(intensity_sum)
+                        count = self.comm.allreduce(count)
+                    if intensity_sum > eps:
+                        alpha_val = max(residual_sum, 0.0) / (intensity_sum + eps)
+                        self.bg_scale_factor = alpha_val
+                        self.bg_scale_factor_auto_done = True
+                        if rank == 0:
+                            mean_residual = residual_sum / max(count, 1)
+                            mean_model = intensity_sum / max(count, 1)
+                            print_flush(
+                                'Auto-estimated intensity scale factor alpha = {:.6g} (mean residual: {:.6g}, mean model I: {:.6g}).'.format(
+                                    float(alpha_val), float(mean_residual), float(mean_model)),
+                                0, rank, **self.stdout_options)
+                    else:
+                        warnings.warn('Predicted intensity sum too small to estimate scale factor; skipping auto alpha.')
                 Ihat = self.bg_scale_factor * I + background
                 Ihat = w.clip(Ihat * self.poisson_multiplier, eps, None)
                 data_intensity = data_intensity * self.poisson_multiplier
@@ -184,6 +220,11 @@ class ForwardModel(object):
             background_batch = w.create_variable(background_map, requires_grad=False, device=self.device)
             if len(pred_batch.shape) > 2:
                 background_batch = w.tile(background_batch, [len(pred_batch), 1, 1])
+        debug_payload = None
+        if self.debug_dark_bg and self.use_dark_bg and not self.debug_dark_bg_done:
+            data_intensity_full = w.abs(this_prj_batch) ** 2 if self.raw_data_type == 'magnitude' else w.abs(this_prj_batch)
+            predicted_intensity_full = pred_intensity if pred_intensity is not None else pred_batch ** 2
+            debug_payload = (data_intensity_full, background_batch, predicted_intensity_full)
         if beamstop is not None:
             beamstop[beamstop >= 1e-5] = 1
             beamstop[beamstop < 1e-5] = 0
@@ -195,6 +236,51 @@ class ForwardModel(object):
             if background_batch is not None:
                 background_batch = w.reshape(background_batch[beamstop_mask_stack], [beamstop_mask_stack.shape[0], -1])
             print_flush('  {} valid pixels remain after applying beamstop mask.'.format(pred_batch.shape[1]), 0, rank)
+        if debug_payload is not None and not self.debug_dark_bg_done:
+            data_intensity_full, background_full, predicted_intensity_full = debug_payload
+            beamstop_np = w.to_numpy(beamstop) if beamstop is not None else None
+            data_np = w.to_numpy(data_intensity_full)
+            I_np = w.to_numpy(predicted_intensity_full)
+            B_np = w.to_numpy(background_full) if background_full is not None else None
+            if beamstop_np is not None:
+                mask_inv = 1 - beamstop_np
+                data_np = data_np * mask_inv
+                I_np = I_np * mask_inv
+                if B_np is not None:
+                    B_np = B_np * mask_inv
+            lambda_np = self.bg_scale_factor * I_np + (B_np if B_np is not None else 0.0)
+            eps = 1e-10
+            lambda_clip = np.clip(lambda_np, eps, None)
+            residual_np = data_np - lambda_clip
+            output_dir = os.path.join(self.common_vars.get('output_folder', '.'), 'debug_dark_bg')
+            if self.comm is not None:
+                self.comm.Barrier()
+            if rank == 0:
+                os.makedirs(output_dir, exist_ok=True)
+                dxchange.write_tiff(data_np.astype('float32'), os.path.join(output_dir, 'data_counts.tiff'), overwrite=True)
+                dxchange.write_tiff((B_np if B_np is not None else np.zeros_like(data_np)).astype('float32'),
+                                    os.path.join(output_dir, 'dark_bg_B.tiff'), overwrite=True)
+                dxchange.write_tiff(I_np.astype('float32'), os.path.join(output_dir, 'pred_I.tiff'), overwrite=True)
+                dxchange.write_tiff(lambda_clip.astype('float32'), os.path.join(output_dir, 'pred_lambda.tiff'), overwrite=True)
+                dxchange.write_tiff(residual_np.astype('float32'), os.path.join(output_dir, 'residual.tiff'), overwrite=True)
+                frac_under_bg = float(np.mean(data_np < (B_np if B_np is not None else 0))) if B_np is not None else 0.0
+                frac_clipped = float(np.mean(lambda_np <= eps))
+                print_flush(
+                    'Debug dark-bg dump -> data(min/mean/max): {:.6g}/{:.6g}/{:.6g}; B(min/mean/max): {:.6g}/{:.6g}/{:.6g}; '
+                    'I(min/mean/max): {:.6g}/{:.6g}/{:.6g}; lambda(min/mean/max): {:.6g}/{:.6g}/{:.6g}; residual(min/mean/max): {:.6g}/{:.6g}/{:.6g}; '
+                    'frac(Y<B): {:.6g}; frac(lambda<=eps): {:.6g}'.format(
+                        float(np.min(data_np)), float(np.mean(data_np)), float(np.max(data_np)),
+                        float(np.min(B_np)) if B_np is not None else 0.0,
+                        float(np.mean(B_np)) if B_np is not None else 0.0,
+                        float(np.max(B_np)) if B_np is not None else 0.0,
+                        float(np.min(I_np)), float(np.mean(I_np)), float(np.max(I_np)),
+                        float(np.min(lambda_np)), float(np.mean(lambda_np)), float(np.max(lambda_np)),
+                        float(np.min(residual_np)), float(np.mean(residual_np)), float(np.max(residual_np)),
+                        frac_under_bg, frac_clipped),
+                    0, rank, **self.stdout_options)
+            if self.comm is not None:
+                self.comm.Barrier()
+            self.debug_dark_bg_done = True
         loss = self.get_mismatch_loss(pred_batch, this_prj_batch, predicted_intensity=pred_intensity, background=background_batch)
         if len(self.reg_list) > 0:
             loss = loss + self.get_regularization_value(obj, device=self.device, **self.loss_args)
@@ -238,6 +324,7 @@ class PtychographyModel(ForwardModel):
         self.run_float64 = run_float64
         self.master_slave_patch_shape_logged = False
         self.master_slave_activation_logged = False
+        self.master_slave_status_logged = False
         self.master_slave_grad_logged = False
         self.master_slave_padding_logged = False
 
@@ -313,10 +400,15 @@ class PtychographyModel(ForwardModel):
         if self.raw_data_type == 'magnitude':
             flag_pp_sqrt = False
 
+        if not use_master_slave and not self.master_slave_status_logged:
+            print_flush('Master-slave propagation disabled for this forward model.', 0, rank, **stdout_options)
+            self.master_slave_status_logged = True
+
         if use_master_slave and not self.master_slave_activation_logged:
             print_flush('Master-slave propagation enabled: coherently summing master and slave exit waves.',
                         0, rank, **stdout_options)
             self.master_slave_activation_logged = True
+            self.master_slave_status_logged = True
 
         # Allocate subbatches.
         probe_pos_batch_ls = []
