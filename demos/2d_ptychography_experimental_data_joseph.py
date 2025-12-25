@@ -88,7 +88,9 @@ for h5_path in h5_files:
                        'n_epochs': 400,
                        'obj_size': (rec_y, rec_x, 1),
                        'two_d_mode': True,
+                       # 'background_data': r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\background_centered_1920.tiff",
                        'background_data': r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\background_centered_1920.tiff",
+                       'use_coherent_master_slave': False,
                        # 'energy_ev': 571,
                        # 'psize_cm': 1.3365e-06,
                        'minibatch_size': 10,
@@ -126,7 +128,7 @@ for h5_path in h5_files:
                        'update_scheme': 'immediate',
                        'unknown_type': 'real_imag',
                        'save_stdout': True,
-                       'loss_function_type': 'lsq',
+                       'loss_function_type': 'poisson',
                        }
 
     params = params_2idd_gpu
